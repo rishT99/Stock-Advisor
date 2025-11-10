@@ -2,8 +2,13 @@ services:
   - type: web
     name: stock-advisor-india
     env: docker
-    plan: free
-    region: frankfurt
     dockerfilePath: ./Dockerfile
     autoDeploy: true
-    healthCheckPath: /dashboard
+    plan: free
+    region: oregon  # or "frankfurt", etc.
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"

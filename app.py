@@ -5,17 +5,58 @@ import os, re, math
 from difflib import get_close_matches
 from datetime import datetime
 from typing import Optional, Literal, Dict, Any, List, Tuple
-from fastapi.responses import RedirectResponse
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from ta.trend import adx
-# ---- Fundamentals cache (6h TTL) ----
 from time import time
+
+# ==========================
+# App meta
+# ==========================
+APP_VERSION = "3.3"
+
+# ==========================
+# Pretty logging
+# ==========================
+try:
+    from colorama import init as colorama_init, Fore, Style  # type: ignore
+    colorama_init()
+    C_OK = Fore.GREEN + "✓" + Style.RESET_ALL
+    C_WARN = Fore.YELLOW + "!" + Style.RESET_ALL
+    C_ERR = Fore.RED + "✗" + Style.RESET_ALL
+    C_INFO = Fore.CYAN + "→" + Style.RESET_ALL
+except Exception:
+    C_OK, C_WARN, C_ERR, C_INFO = "✓", "!", "✗", "→"
+
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("stockadvisor")
+
+# ==========================
+# Optional imports (guarded)
+# ==========================
+try:
+    import yfinance as yf  # type: ignore
+except Exception:
+    yf = None
+
+try:
+    import ta  # type: ignore
+except Exception:
+    ta = None
+
+try:
+    import feedparser  # type: ignore
+except Exception:
+    feedparser = None
+
+# ==========================
+# Fundamentals cache (6h TTL)
+# ==========================
 FUND_TTL_SEC = 6 * 3600
 FUND_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 PEER_INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -32,60 +73,28 @@ def _cache_get(cache: dict, key: str):
 def _cache_put(cache: dict, key: str, val: dict):
     cache[key] = (time(), val)
 
-
-# -------- Pretty logging --------
-try:
-    from colorama import init as colorama_init, Fore, Style  # type: ignore
-    colorama_init()
-    C_OK = Fore.GREEN + "✓" + Style.RESET_ALL
-    C_WARN = Fore.YELLOW + "!" + Style.RESET_ALL
-    C_ERR = Fore.RED + "✗" + Style.RESET_ALL
-    C_INFO = Fore.CYAN + "→" + Style.RESET_ALL
-except Exception:
-    C_OK, C_WARN, C_ERR, C_INFO = "✓", "!", "✗", "→"
-
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger("stockadvisor")
-
-# -------- Optional imports (guarded) --------
-try:
-    import yfinance as yf  # type: ignore
-except Exception:
-    yf = None
-
-try:
-    import ta  # type: ignore
-except Exception:
-    ta = None
-
-try:
-    import feedparser  # type: ignore
-except Exception:
-    feedparser = None
-
-app = FastAPI(title="Stock Advisor Bot — India v3.3")
+# ==========================
+# FastAPI
+# ==========================
+app = FastAPI(title=f"Stock Advisor Bot — India v{APP_VERSION}")
 templates = Jinja2Templates(directory="templates")
 
 # ==========================
 # JSON SANITIZER + HANDLERS
 # ==========================
 def _num_sane(x):
-    """Return a JSON-safe numeric or None."""
     try:
         if x is None:
             return None
-        # numpy scalars
         if isinstance(x, (np.floating, np.integer)):
             x = float(x) if isinstance(x, np.floating) else int(x)
-        if isinstance(x, float):
-            if math.isnan(x) or math.isinf(x):
-                return None
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return None
         return x
     except Exception:
         return None
 
 def _to_jsonable(obj):
-    """Recursively convert objects to JSON-safe structures."""
     if obj is None or isinstance(obj, (str, bool)):
         return obj
     if isinstance(obj, (int, float, np.floating, np.integer)):
@@ -127,11 +136,14 @@ async def unhandled_exc(request: Request, exc: Exception):
     log.exception(f"{C_ERR} Unhandled error: {exc}")
     return json_ok({"ok": False, "error": "internal_error"}, status=500)
 
-# -------- In-memory news store --------
-# Each item: {"symbol": "RELIANCE" or "*" for market, "headline": str, "ts": pd.Timestamp(UTC-aware)}
+# ==========================
+# In-memory news store
+# ==========================
 NEWS_DB: List[Dict[str, Any]] = []
 
-# -------- Models --------
+# ==========================
+# Models
+# ==========================
 class AdviceRequest(BaseModel):
     symbol: str = Field(..., description="Ticker. 'RELIANCE' auto-uses .NS; use .BO for BSE")
     goal: Optional[Literal["short_term", "swing", "long_term"]] = Field(None, description="If omitted, inferred")
@@ -182,13 +194,14 @@ class ScanRequest(BaseModel):
     min_confluence: int = 2
     max_daily_risk_frac: float = 0.02
 
-# ---- UI Log Buffer (ring) ----
+# ==========================
+# UI Log Buffer (ring)
+# ==========================
 class UIBufferHandler(logging.Handler):
     def __init__(self, capacity: int = 2000):
         super().__init__()
         self.capacity = capacity
         self.buf: List[str] = []
-
     def emit(self, record: logging.LogRecord):
         try:
             msg = self.format(record)
@@ -202,7 +215,9 @@ UI_LOG_HANDLER = UIBufferHandler(capacity=2000)
 UI_LOG_HANDLER.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 log.addHandler(UI_LOG_HANDLER)
 
-# -------- Symbol universe / normalization --------
+# ==========================
+# Symbol universe / normalization
+# ==========================
 SYMBOL_UNI: Dict[str, str] = {}
 STOPWORDS = {"LTD","LIMITED","CO","COMPANY","PLC","PVT","INC","AND","OF","THE"}
 
@@ -253,7 +268,9 @@ def normalize_symbol_for_india(symbol: str) -> str:
     nospace = canon.replace(" ", "")
     return f"{nospace}.NS"
 
-# -------- Helpers --------
+# ==========================
+# Helpers
+# ==========================
 def _utc_aware(ts_like) -> pd.Timestamp:
     if isinstance(ts_like, pd.Timestamp):
         if ts_like.tzinfo is None:
@@ -263,6 +280,92 @@ def _utc_aware(ts_like) -> pd.Timestamp:
         return pd.to_datetime(ts_like, utc=True)
     except Exception:
         return pd.Timestamp.now(tz="UTC")
+
+# ---------- yfinance SAFE HISTORY (no custom session!) ----------
+def _download_sym(sym: str, period: str) -> pd.DataFrame:
+    # Use yfinance internal client (no session, no threads)
+    df = yf.download(sym, period=period, auto_adjust=False, progress=False, threads=False)
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+def _ticker_history(sym: str, period: str) -> pd.DataFrame:
+    df = yf.Ticker(sym).history(period=period)
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+def safe_history(sym_in: str, period_first: str = "400d") -> pd.DataFrame:
+    if yf is None:
+        return pd.DataFrame()
+
+    # indices pass through; others get NSE/BSE variants
+    if sym_in.startswith("^"):
+        candidates = [sym_in]
+    else:
+        s = normalize_symbol_for_india(sym_in)
+        base = s[:-3] if s.endswith((".NS", ".BO")) else s
+        candidates = [f"{base}.NS", f"{base}.BO"]
+
+    for sym in dict.fromkeys(candidates):
+        for per in [period_first, "max"]:
+            for fn in (_download_sym, _ticker_history):
+                try:
+                    df = fn(sym, per)
+                    if not df.empty:
+                        log.info(f"{C_OK} History ok for {sym} (period={per}, rows={len(df)})")
+                        return df
+                except Exception as e:
+                    log.info(f"{C_WARN} History attempt failed for {sym}: {e}")
+    return pd.DataFrame()
+
+def normalize_ohlcv_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize yfinance OHLCV to a single-ticker, single-index DataFrame with
+    columns: Open, High, Low, Close, Volume (capitalized).
+    Handles MultiIndex columns (download-style) by selecting the first ticker.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # If MultiIndex columns (e.g., ('Open','^NSEI')), select the first ticker layer.
+    if isinstance(df.columns, pd.MultiIndex):
+        # Try common layout: top level is field (Open/High/Low/Close/Volume), inner is ticker
+        lvl0 = df.columns.get_level_values(0)
+        if {"Open","High","Low","Close","Volume"}.issubset(set(lvl0)):
+            # pick the first inner ticker present across fields
+            try:
+                inner_candidates = df["Close"].columns
+                inner = inner_candidates[0]
+                df = df.xs(inner, axis=1, level=-1)
+            except Exception:
+                # fallback: take first available column per field
+                parts = {}
+                for fld in ["Open","High","Low","Close","Volume"]:
+                    try:
+                        parts[fld] = df[fld].iloc[:, 0]
+                    except Exception:
+                        parts[fld] = pd.Series(dtype=float, index=df.index)
+                df = pd.concat(parts, axis=1)
+        else:
+            # Alternate layout: outer is ticker, inner is field
+            try:
+                outer = df.columns.get_level_values(0)[0]
+                df = df.xs(outer, axis=1, level=0)
+            except Exception:
+                # last resort: drop to first level columns
+                df.columns = [c[0] for c in df.columns]
+
+    # Lowercase-to-title case mapping
+    rename_map = {c: c.capitalize() for c in ["open", "high", "low", "close", "volume"]}
+    df = df.rename(columns=rename_map)
+
+    # If "Date" column exists, set as index
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").set_index("Date")
+
+    # Keep only required columns in correct order
+    needed = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+    df = df[needed].dropna(how="any")
+    return df
+
 
 def load_ohlcv(symbol: str, csv_path: Optional[str]) -> pd.DataFrame:
     if csv_path:
@@ -281,119 +384,135 @@ def load_ohlcv(symbol: str, csv_path: Optional[str]) -> pd.DataFrame:
         log.info(f"{C_ERR} yfinance not available — cannot fetch {symbol}")
         raise HTTPException(400, "yfinance not available. Provide data_csv.")
 
-    try:
-        ysym = normalize_symbol_for_india(symbol)
-        log.info(f"{C_INFO} Loading OHLCV from Yahoo for {ysym}...")
-        y = yf.Ticker(ysym)
-        df = y.history(period="400d")
-        if len(df) < 260:
-            df = y.history(period="max")
+    df = safe_history(symbol, period_first="400d")
+    if df.empty:
+        raise HTTPException(404, f"No data for {symbol}")
 
-        if df.empty or len(df) < 20:
-            base = ysym[:-3] if (ysym.endswith(".NS") or ysym.endswith(".BO")) else ysym
-            candidates: List[str] = []
-            uni_guess = _best_symbol_guess_from_universe(symbol)
-            if uni_guess:
-                candidates.append(uni_guess + ".NS")
-            candidates.append(base.replace(" ", "") + (".NS" if not base.endswith((".NS",".BO")) else ""))
-            if not base.endswith(".BO"):
-                candidates.append(base.replace(" ", "") + ".BO")
-
-            for cand in [c for c in dict.fromkeys(candidates) if c and c != ysym]:
-                try:
-                    log.info(f"{C_WARN} No/low data for {ysym}. Retrying with {cand} ...")
-                    y2 = yf.Ticker(cand)
-                    df2 = y2.history(period="400d")
-                    if len(df2) < 260:
-                        df2 = y2.history(period="max")
-                    if not df2.empty:
-                        ysym = cand
-                        df = df2
-                        break
-                except Exception:
-                    pass
-
-        if df.empty:
-            log.info(f"{C_WARN} No data for {ysym}")
-            raise HTTPException(404, f"No data for {ysym}")
-
-        df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"})
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        log.info(f"{C_OK} Got {len(df)} rows of OHLCV for {ysym}")
-        return df
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.info(f"{C_ERR} Failed to fetch {symbol}: {e}")
-        raise HTTPException(400, f"Failed to fetch data for {symbol}: {e}")
+    df = normalize_ohlcv_schema(df)
+    if df.empty:
+        raise HTTPException(404, f"No usable OHLCV for {symbol}")
+    log.info(f"{C_OK} Got {len(df)} rows of OHLCV for {normalize_symbol_for_india(symbol)}")
+    return df
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    log.info(f"{C_INFO} Computing features (ATR, SMAs, ROC, Volume, RSI)...")
-    d = df.copy()
+    log.info(f"{C_INFO} Computing features (adaptive windows)…")
+    d = df.copy().sort_index()
+
+    n = len(d)
+    # Adaptive windows (prefer canonical, fall back for short histories)
+    w20  = 20 if n >= 25  else max(10, n // 6)      # 10..20
+    w50  = 50 if n >= 60  else max(30, n // 4)      # 30..50
+    # effective "SMA200"; degrade to 100 or 50 when history is short
+    w200 = 200 if n >= 220 else (100 if n >= 120 else (50 if n >= 60 else None))
+
+    if w200 is None:
+        log.info(f"{C_ERR} Dataset too short for lite features (n={n})")
+        raise HTTPException(400, "Not enough data. Need at least ~60 rows.")
+
+    # True Range → ATR14 (keep 14 to avoid over-fitting tiny windows)
     tr1 = (d["High"] - d["Low"]).abs()
     tr2 = (d["High"] - d["Close"].shift()).abs()
-    tr3 = (d["Low"] - d["Close"].shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    d["ATR14"] = tr.rolling(14).mean()
-    d["SMA20"] = d["Close"].rolling(20).mean()
-    d["SMA50"] = d["Close"].rolling(50).mean()
-    d["SMA200"] = d["Close"].rolling(200).mean()
-    d["ROC10"] = d["Close"].pct_change(10)
-    d["ROC50"] = d["Close"].pct_change(50)
-    d["VolMA20"] = d["Volume"].rolling(20).mean()
-    # relaxed threshold: 1.2x MA20
+    tr3 = (d["Low"]  - d["Close"].shift()).abs()
+    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    d["ATR14"] = tr.rolling(14, min_periods=14).mean()
+
+    # Moving averages (adaptive)
+    d["SMA20"]  = d["Close"].rolling(w20,  min_periods=w20).mean()
+    d["SMA50"]  = d["Close"].rolling(w50,  min_periods=w50).mean()
+    d["SMA200"] = d["Close"].rolling(w200, min_periods=w200).mean()  # name kept for downstream logic
+
+    # Momentum (adaptive)
+    roc10_w = 10 if n >= 15 else max(5, n // 8)
+    roc50_w = 50 if n >= 60 else max(20, n // 3)
+    d["ROC10"] = d["Close"].pct_change(roc10_w)
+    d["ROC50"] = d["Close"].pct_change(roc50_w)
+
+    # Volume features
+    vol_ma_w = 20 if n >= 25 else max(10, n // 6)
+    d["VolMA20"]  = d["Volume"].rolling(vol_ma_w, min_periods=vol_ma_w).mean()
     d["VolBurst"] = (d["Volume"] > 1.2 * d["VolMA20"]).astype(int)
+
+    # RSI
     if ta is not None:
         try:
-            d["RSI14"] = ta.momentum.RSIIndicator(d["Close"], window=14).rsi()
+            rsi_w = 14 if n >= 20 else max(8, n // 7)
+            d["RSI14"] = ta.momentum.RSIIndicator(d["Close"], window=rsi_w).rsi()
         except Exception:
             d["RSI14"] = np.nan
     else:
         d["RSI14"] = np.nan
 
-    # --- Trend Strength (SMA slope + ADX) ---
+    # Trend Strength (ADX + slope)
     try:
-        d["ADX14"] = adx(d["High"], d["Low"], d["Close"], window=14)
-        slope = (d["SMA50"].iloc[-1] - d["SMA50"].iloc[-10]) / 10
+        adx_w = 14 if n >= 20 else max(8, n // 7)
+        d["ADX14"] = adx(d["High"], d["Low"], d["Close"], window=adx_w)
+        slope_w = 10 if n >= 20 else max(5, n // 10)
+        sma_for_slope = "SMA50" if n >= 60 else "SMA20"
+        slope = (d[sma_for_slope].iloc[-1] - d[sma_for_slope].iloc[-slope_w]) / slope_w
         norm_slope = np.clip((slope / d["Close"].iloc[-1]) * 1000, -100, 100)
-        d["TrendStrength"] = np.clip((abs(norm_slope) + d["ADX14"].iloc[-1]) / 2, 0, 100)
+        last_adx = d["ADX14"].iloc[-1] if pd.notna(d["ADX14"].iloc[-1]) else 0
+        d["TrendStrength"] = np.clip((abs(norm_slope) + last_adx) / 2, 0, 100)
     except Exception:
         d["TrendStrength"] = np.nan
 
-    d = d.dropna()
-    log.info(f"{C_OK} Features ready (rows={len(d)})")
+    keep_cols = ["Open","High","Low","Close","Volume","ATR14","SMA20","SMA50","SMA200","ROC10","ROC50","VolMA20","VolBurst","RSI14","TrendStrength"]
+    d = d[keep_cols].dropna()
+
+    # Expose what windows were used (to show in UI)
+    d.attrs["feature_windows"] = {
+        "SMA20": w20, "SMA50": w50, "SMA200_effective": w200,
+        "ROC10": roc10_w, "ROC50": roc50_w, "VOL_MA": vol_ma_w
+    }
+    log.info(f"{C_OK} Features ready (rows={len(d)}) | windows={d.attrs['feature_windows']}")
     return d
 
-# -------- Market Regime (NIFTY) --------
+# ==========================
+# Market Regime (robust)
+# ==========================
 def get_nifty_regime() -> Dict[str, Any]:
-    sym = "^NSEI"
+    """Try ^NSEI → NIFTYBEES.NS → ^BSESN. Flatten columns and use 1-D Series to compare."""
     if yf is None:
-        return {"symbol": sym, "ok": False, "reason": "yfinance not available"}
-    try:
-        log.info(f"{C_INFO} Checking NIFTY 50 regime...")
-        df = yf.Ticker(sym).history(period="max")
-        if df.empty:
-            return {"symbol": sym, "ok": False, "reason": "no data"}
-        df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"})
-        df["SMA200"] = df["Close"].rolling(200).mean()
-        row = df.iloc[-1]
-        regime_up = bool(row["Close"] > row["SMA200"])
-        ret5d = float((row["Close"] / df["Close"].iloc[-5]) - 1) if len(df) >= 5 else 0.0
-        out = {
-            "symbol": sym,
-            "ok": True,
-            "close": round(float(row["Close"]), 2),
-            "sma200": round(float(row["SMA200"]), 2),
-            "regime": "UP" if regime_up else "DOWN",
-            "ret_5d": round(ret5d, 4),
-        }
-        log.info(f"{C_OK} NIFTY regime: {out['regime']} | 5d={out['ret_5d']}")
-        return out
-    except Exception as e:
-        log.info(f"{C_ERR} Failed regime check: {e}")
-        return {"symbol": sym, "ok": False, "reason": str(e)}
+        return {"ok": False, "reason": "yfinance missing"}
 
-# -------- Sentiment (headlines) --------
+    tried = []
+    for sym in ["^NSEI", "NIFTYBEES.NS", "^BSESN"]:
+        raw = safe_history(sym, period_first="max")
+        df = normalize_ohlcv_schema(raw)
+        tried.append((sym, len(df)))
+        if len(df) >= 210 and "Close" in df.columns:
+            close = df["Close"]
+            # Ensure 1-D series
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            sma200 = close.rolling(200).mean()
+
+            # Latest values as scalars
+            try:
+                row_close = float(close.iloc[-1])
+                row_sma200 = float(sma200.iloc[-1])
+            except Exception:
+                continue
+
+            regime_up = row_close > row_sma200
+            ret5d = float((row_close / float(close.iloc[-5])) - 1) if len(close) >= 5 else 0.0
+
+            out = {
+                "symbol": sym,
+                "ok": True,
+                "close": round(row_close, 2),
+                "sma200": round(row_sma200, 2),
+                "regime": "UP" if regime_up else "DOWN",
+                "ret_5d": round(ret5d, 4),
+                "proxy": (sym != "^NSEI"),
+            }
+            log.info(f"{C_OK} Regime via {sym}: {out['regime']} | 5d={out['ret_5d']}")
+            return out
+
+    return {"ok": False, "reason": f"no valid index data {tried}"}
+
+# ==========================
+# Sentiment (headlines)
+# ==========================
 POS_WORDS = {
     "beats","beat","surge","surges","rises","up","upgrade","record","profit","growth","wins",
     "approval","order","contract","acquires","merger","strong","positive","bullish","expands",
@@ -454,7 +573,7 @@ def get_sentiment_factor(symbol: str) -> float:
 def recent_headlines_for(symbol: str, limit: int = 8) -> List[Dict[str, Any]]:
     s_upper = normalize_symbol_for_india(symbol).split(".")[0]
     out: List[Dict[str, Any]] = []
-    for it in NEWS_DB[::-1]:  # newest first
+    for it in NEWS_DB[::-1]:
         sym = str(it.get("symbol", "*")).upper()
         headline = str(it.get("headline", ""))
         if sym in {"*", s_upper} or s_upper in headline.upper():
@@ -470,16 +589,16 @@ def recent_headlines_for(symbol: str, limit: int = 8) -> List[Dict[str, Any]]:
                 break
     return out
 
-# -------- Fundamentals (Yahoo info) --------
+# ==========================
+# Fundamentals (Yahoo info)
+# ==========================
 def safe_get(info: dict, key: str, default=None):
     try:
         v = info.get(key, default)
         if v is None:
             return default
-        # many are ratios in 0..1; keep numeric
         if isinstance(v, (int, float, np.integer, np.floating)):
             return float(v)
-        # strings of numbers
         try:
             return float(v)
         except Exception:
@@ -488,7 +607,6 @@ def safe_get(info: dict, key: str, default=None):
         return default
 
 def get_fundamentals(symbol: str) -> Dict[str, Any]:
-    """Compact fundamentals from Yahoo Finance with light normalization."""
     if yf is None or not symbol:
         return {"ok": False, "reason": "yfinance unavailable or empty symbol"}
 
@@ -499,21 +617,25 @@ def get_fundamentals(symbol: str) -> Dict[str, Any]:
 
     try:
         info = yf.Ticker(ysym).info or {}
-        # Pull raw values
+        if not info:
+            # occasionally first call empty; retry once
+            info = yf.Ticker(ysym).info or {}
+        if not info:
+            raise ValueError("Empty Yahoo info")
+
         trailingPE = safe_get(info, "trailingPE")
         forwardPE = safe_get(info, "forwardPE")
         pegRatio = safe_get(info, "pegRatio")
-        returnOnEquity = safe_get(info, "returnOnEquity")   # usually ratio (0..1)
-        debtToEquity_raw = safe_get(info, "debtToEquity")   # often percent!
+        returnOnEquity = safe_get(info, "returnOnEquity")   # ratio (0..1)
+        debtToEquity_raw = safe_get(info, "debtToEquity")   # often percent
         profitMargins = safe_get(info, "profitMargins")     # ratio (0..1)
         revenueGrowth = safe_get(info, "revenueGrowth")     # ratio (0..1)
         eqGrowth = safe_get(info, "earningsQuarterlyGrowth")
 
-        # Normalize D/E: Yahoo typically reports percentage (e.g., 81.25 = 0.8125×)
         de_ratio = None
         if isinstance(debtToEquity_raw, (int, float)):
             de_ratio = float(debtToEquity_raw)
-            if de_ratio > 10:  # treat as percent if it looks large
+            if de_ratio > 10:
                 de_ratio = de_ratio / 100.0
 
         out = {
@@ -527,7 +649,6 @@ def get_fundamentals(symbol: str) -> Dict[str, Any]:
             "profitMargins": profitMargins,
             "revenueGrowth": revenueGrowth,
             "earningsQuarterlyGrowth": eqGrowth,
-            # pass through for sector comparisons
             "sector": info.get("sector"),
             "industry": info.get("industry"),
         }
@@ -538,19 +659,11 @@ def get_fundamentals(symbol: str) -> Dict[str, Any]:
         return {"ok": False, "reason": str(e)}
 
 def score_fundamentals(fin: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
-    """
-    Returns (normalized_score_0_20, breakdown_dict).
-    Raw points up to 30, then normalized to 0..20 for blending.
-    - Ignores non-positive PE (no reward for negative PE).
-    - D/E already normalized to ratio in get_fundamentals.
-    """
     if not fin or not fin.get("ok"):
         return 0.0, {"ok": False, "reason": fin.get("reason", "no data")}
-
     pts = 0.0
     br: Dict[str, Any] = {"ok": True, "rules": []}
 
-    # Valuation: PE (use min of trailing/forward; ignore if <= 0)
     pe_vals = [v for v in [fin.get("trailingPE"), fin.get("forwardPE")] if isinstance(v, (int, float)) and v > 0]
     pe = min(pe_vals) if pe_vals else None
     if pe is not None:
@@ -558,36 +671,31 @@ def score_fundamentals(fin: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         if pe < 18: pts += 2; br["rules"].append({"factor":"PE","value":pe,"bonus":"+2 (<18)"})
     br["PE_used"] = pe
 
-    # Profitability: ROE (expect 0..1)
     roe = fin.get("returnOnEquity")
     if isinstance(roe, (int, float)):
         if roe > 0.15: pts += 5; br["rules"].append({"factor":"ROE","value":roe,"bonus":"+5 (>15%)"})
         if roe > 0.20: pts += 2; br["rules"].append({"factor":"ROE","value":roe,"bonus":"+2 (>20%)"})
     br["ROE"] = roe
 
-    # Balance sheet: D/E (ratio)
     de = fin.get("debtToEquity")
     if isinstance(de, (int, float)):
         if de < 1.0: pts += 5; br["rules"].append({"factor":"D/E","value":de,"bonus":"+5 (<1.0)"})
         if de < 0.5: pts += 2; br["rules"].append({"factor":"D/E","value":de,"bonus":"+2 (<0.5)"})
     br["DebtToEquity"] = de
 
-    # Margins
     pm = fin.get("profitMargins")
     if isinstance(pm, (int, float)):
         if pm > 0.10: pts += 5; br["rules"].append({"factor":"ProfitMargin","value":pm,"bonus":"+5 (>10%)"})
         if pm > 0.15: pts += 2; br["rules"].append({"factor":"ProfitMargin","value":pm,"bonus":"+2 (>15%)"})
     br["ProfitMargins"] = pm
 
-    # Growth (prefer revenueGrowth, fallback EQG)
     gr = fin.get("revenueGrowth")
     if not isinstance(gr, (int, float)):
         gr = fin.get("earningsQuarterlyGrowth")
-    if isinstance(gr, (int, float)):
-        if gr > 0.05: pts += 5; br["rules"].append({"factor":"Growth","value":gr,"bonus":"+5 (>5%)"})
+    if isinstance(gr, (int, float)) and gr > 0.05:
+        pts += 5; br["rules"].append({"factor":"Growth","value":gr,"bonus":"+5 (>5%)"})
     br["Growth"] = gr
 
-    # PEG
     peg = fin.get("pegRatio")
     if isinstance(peg, (int, float)):
         if peg < 1.5: pts += 5; br["rules"].append({"factor":"PEG","value":peg,"bonus":"+5 (<1.5)"})
@@ -600,92 +708,71 @@ def score_fundamentals(fin: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
     br["norm_0_20"] = round(norm, 2)
     return float(round(norm, 2)), br
 
-# -------- Sector / Industry Comparison --------
+# ==========================
+# Sector / Industry Comparison
+# ==========================
 def sector_comparison(symbol: str, info: Dict[str, Any]) -> Dict[str, Any]:
-    """Compare PE/ROE/D/E vs sector median using a small peer sample."""
     try:
-        if yf is None or not info or not info.get("ok"):
-            return {"ok": False, "reason": "no fundamentals"}
-
+        if yf is None or not info:
+            return {"ok": False, "reason": "no yfinance or info"}
         sec = info.get("sector") or "Unknown"
         ind = info.get("industry") or "Unknown"
-        ysym = normalize_symbol_for_india(symbol)
 
-        # small, stable NIFTY peer list
         nifty_peers = [
             "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
             "LT.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS","ITC.NS",
             "ASIANPAINT.NS","HINDUNILVR.NS","BAJFINANCE.NS","MARUTI.NS","SUNPHARMA.NS"
         ]
 
-        peers = []
-        for tkr in nifty_peers:
-            if tkr == ysym:  # skip self
+        sector_infos = []
+        for t in nifty_peers:
+            try:
+                i = yf.Ticker(t).info or {}
+                if i.get("sector") == sec and t != symbol:
+                    sector_infos.append(i)
+            except Exception:
                 continue
-            cached = _cache_get(PEER_INFO_CACHE, tkr)
-            if cached is None:
-                try:
-                    i = yf.Ticker(tkr).info or {}
-                    _cache_put(PEER_INFO_CACHE, tkr, i)
-                    cached = i
-                except Exception:
-                    continue
-            if cached.get("sector") == sec:
-                peers.append(cached)
 
-        if not peers:
+        if not sector_infos:
             return {"sector": sec, "industry": ind, "ok": False, "reason": "no peers"}
 
-        def sfloat(i, k):
+        def safe_val(i, k):
             v = i.get(k)
             try:
                 return float(v) if v is not None else math.nan
             except Exception:
                 return math.nan
 
-        # Collect peer metrics (normalize D/E to ratio)
-        def de_norm(v):
-            if not isinstance(v, (int, float)):
-                return math.nan
-            return v/100.0 if v > 10 else float(v)
-
-        peers_pe  = [sfloat(p, "trailingPE") for p in peers]
-        peers_roe = [sfloat(p, "returnOnEquity") for p in peers]
-        peers_de  = [de_norm(sfloat(p, "debtToEquity")) for p in peers]
+        peers_pe  = [safe_val(i, "trailingPE") for i in sector_infos]
+        peers_roe = [safe_val(i, "returnOnEquity") for i in sector_infos]
+        peers_de  = [safe_val(i, "debtToEquity") for i in sector_infos]
 
         pe_med  = np.nanmedian(peers_pe)  if peers_pe else math.nan
         roe_med = np.nanmedian(peers_roe) if peers_roe else math.nan
         de_med  = np.nanmedian(peers_de)  if peers_de else math.nan
 
-        my_pe  = info.get("trailingPE")
-        my_roe = info.get("returnOnEquity")
-        my_de  = info.get("debtToEquity")
-
-        def comp(val, med, mode):
-            if not isinstance(val, (int, float)) or not math.isfinite(val):
-                return "-"
-            if not isinstance(med, (int, float)) or not math.isfinite(med):
-                return "-"
-            if mode == "pe":  return "better" if (val > 0 and val < med) else "worse"
-            if mode == "roe": return "better" if val > med else "worse"
-            if mode == "de":  return "better" if val < med else "worse"
-            return "-"
+        pe  = safe_val(info, "trailingPE")
+        roe = safe_val(info, "returnOnEquity")
+        de  = safe_val(info, "debtToEquity")
+        if isinstance(de, (float, int)) and de > 10:
+            de = de / 100.0
 
         return {
-            "ok": True,
             "sector": sec,
             "industry": ind,
-            "pe_vs_sector":  comp(my_pe,  pe_med,  "pe"),
-            "roe_vs_sector": comp(my_roe, roe_med, "roe"),
-            "de_vs_sector":  comp(my_de,  de_med,  "de"),
-            "pe_sector_median":  pe_med,
+            "pe_vs_sector": "better" if (pe  <  pe_med) else "worse" if (not math.isnan(pe)  and not math.isnan(pe_med)) else None,
+            "roe_vs_sector": "better" if (roe >  roe_med) else "worse" if (not math.isnan(roe) and not math.isnan(roe_med)) else None,
+            "de_vs_sector":  "better" if (de  <  de_med) else "worse" if (not math.isnan(de)  and not math.isnan(de_med)) else None,
+            "pe_sector_median": pe_med,
             "roe_sector_median": roe_med,
-            "de_sector_median":  de_med,
+            "de_sector_median": de_med,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# -------- Scoring & Sizing (technical) --------
+# ==========================
+# Scoring & Sizing (technical)
+# ==========================
 def horizon_params(goal: str) -> dict:
     if goal == "short_term":
         return dict(win_rr=1.2, hold_days=5, lookback=50, stop_k=1.0, tgt_k=1.5)
@@ -707,7 +794,6 @@ def score_signal(row: pd.Series, goal: str, symbol_for_sentiment: Optional[str] 
     comp: Dict[str, float] = {}
     score = 0.0
 
-    # Trend alignment
     trend = 0
     if row["SMA20"] > row["SMA50"]:
         trend += 1
@@ -716,23 +802,19 @@ def score_signal(row: pd.Series, goal: str, symbol_for_sentiment: Optional[str] 
     comp["trend"] = 20 * trend
     score += comp["trend"]
 
-    # Momentum
     m1 = max(0.0, min(1.0, row["ROC10"] * 10))
     m2 = max(0.0, min(1.0, row["ROC50"] * 10))
     comp["momentum"] = 20 * (0.6 * m1 + 0.4 * m2)
     score += comp["momentum"]
 
-    # Extension vs SMA20 using ATR
     ext = (row["Close"] - row["SMA20"]) / (row["ATR14"] + 1e-9)
     ext_score = 20 * max(0, 1 - abs(ext - 1) / 2)
     comp["extension"] = ext_score
     score += ext_score
 
-    # Volume burst
     comp["volume"] = 10 if int(row.get("VolBurst", 0)) == 1 else 0
     score += comp["volume"]
 
-    # RSI guard
     rsi = row.get("RSI14", np.nan)
     if pd.notna(rsi):
         if 45 <= rsi <= 70:
@@ -745,7 +827,6 @@ def score_signal(row: pd.Series, goal: str, symbol_for_sentiment: Optional[str] 
             comp["rsi"] = 0
         score += comp["rsi"]
 
-    # Sentiment
     sent_factor = 0.0
     if symbol_for_sentiment:
         sent_factor = get_sentiment_factor(symbol_for_sentiment)
@@ -753,7 +834,6 @@ def score_signal(row: pd.Series, goal: str, symbol_for_sentiment: Optional[str] 
     comp["sentiment"] = 10 * float(sent_factor)
     score += comp["sentiment"]
 
-    # Goal bias
     if goal == "long_term" and row["Close"] > row["SMA200"]:
         comp["goal_bias"] = 10
         score += 10
@@ -775,11 +855,11 @@ def kelly_cap(prob_win: float, rr: float) -> float:
         return 0.0
     return float(max(0.0, min(edge / rr, 0.2)))
 
-# -------- Auto news (RSS) --------
+# ==========================
+# Auto news (RSS)
+# ==========================
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-DEFAULT_SOURCE_QUERY = (
-    "(site:economictimes.indiatimes.com OR site:moneycontrol.com OR site:livemint.com OR site:business-standard.com)"
-)
+DEFAULT_SOURCE_QUERY = "(site:economictimes.indiatimes.com OR site:moneycontrol.com OR site:livemint.com OR site:business-standard.com)"
 
 def _url_q(s: str) -> str:
     return s.replace(" ", "%20")
@@ -810,7 +890,6 @@ def auto_fetch_headlines_for_symbol(symbol: str, max_items: int = 10) -> int:
             ts_parsed = pd.to_datetime(ts, utc=True) if ts else pd.Timestamp.now(tz="UTC")
         except Exception:
             ts_parsed = pd.Timestamp.now(tz="UTC")
-
         NEWS_DB.append({"symbol": s.upper(), "headline": title, "ts": ts_parsed})
         count += 1
     log.info(f"{C_OK} Added {count} headlines for {s}")
@@ -841,13 +920,14 @@ def auto_fetch_market_headlines(max_items: int = 20) -> int:
             ts_parsed = pd.to_datetime(ts, utc=True) if ts else pd.Timestamp.now(tz="UTC")
         except Exception:
             ts_parsed = pd.Timestamp.now(tz="UTC")
-
         NEWS_DB.append({"symbol": "*", "headline": title, "ts": ts_parsed})
         count += 1
     log.info(f"{C_OK} Added {count} market headlines")
     return count
 
-
+# ==========================
+# Advice core
+# ==========================
 def make_advice(
     df: pd.DataFrame,
     goal: Optional[str],
@@ -861,29 +941,27 @@ def make_advice(
     d = compute_features(df)
     log.info(f"{C_INFO} Rows: raw={len(df)} after_features={len(d)}")
 
-    if len(d) < 200:
-        log.info(f"{C_ERR} Not enough data after features (need ~200 rows)")
-        raise HTTPException(400, "Not enough data. Need at least ~200 rows.")
+    if len(d) < 60:
+        log.info(f"{C_ERR} Not enough data even for lite mode (need ≥ ~60 rows)")
+        raise HTTPException(400, "Not enough data. Need at least ~60 rows.")
+
+
 
     row = d.iloc[-1]
     use_goal = goal or infer_goal_from_market(row)
     params = horizon_params(use_goal)
 
-    # Technical score
     tech_score, breakdown = score_signal(row, use_goal, symbol_for_sentiment=symbol_for_sentiment)
 
-    # Fundamentals score (normalized 0..20), blended 20% weight
     fund_info = get_fundamentals(symbol_for_sentiment or "")
     fund_score, fund_break = score_fundamentals(fund_info)
-    # Sector comparison
+
     sector_cmp = sector_comparison(symbol_for_sentiment or "", fund_info)
 
     total_score = round(0.8 * tech_score + 0.2 * fund_score, 2)
 
-    # Score -> win probability (loose calibration)
     prob_win = max(0.35, min(0.7, 0.45 + (total_score - 50) / 350))
 
-    # Entry/stop/targets
     close = float(row["Close"])
     atr = float(row["ATR14"])
     stop = close - params["stop_k"] * atr
@@ -892,14 +970,12 @@ def make_advice(
 
     rr = (tgt1 - close) / (close - stop) if (close - stop) > 0 else 0.0
 
-    # Regime guard
     regime = get_nifty_regime()
     regime_ok = bool(regime.get("ok") and regime.get("regime") == "UP")
     if not regime_ok:
         prob_win = max(0.35, prob_win - 0.03)
         log.info(f"{C_WARN} Market regime DOWN — tightening criteria & sizing")
 
-    # Sizing with daily risk cap
     frac1 = risk_fraction(risk_level)
     frac2 = kelly_cap(prob_win, max(1.0, rr))
     base_alloc_frac = max(0.002, min(frac1, frac2 if prob_win > 0.5 else frac1 * 0.7))
@@ -914,7 +990,6 @@ def make_advice(
     qty_alloc = int(max_alloc // risk_per_share)
     qty = max(0, min(qty_alloc, qty_cap_daily))
 
-    # Confluence requirement + flags & reasons (still based on technical/sentiment flags)
     flags = {
         "trend_ok": breakdown.get("trend", 0) >= 20,
         "momentum_ok": breakdown.get("momentum", 0) >= 8,
@@ -944,9 +1019,7 @@ def make_advice(
     elif 50 <= total_score < 65 and green >= max(1, min_conf_final - 1):
         decision = "HOLD"
 
-    log.info(
-        f"{C_INFO} FUND score_norm(0..20)={fund_score:.2f} | TECH={tech_score:.2f} | TOTAL={total_score:.2f}"
-    )
+    log.info(f"{C_INFO} FUND score_norm(0..20)={fund_score:.2f} | TECH={tech_score:.2f} | TOTAL={total_score:.2f}")
     log.info(
         f"{C_OK if decision=='BUY' else (C_WARN if decision=='HOLD' else C_ERR)} "
         f"Decision={decision} | Score={total_score:.1f} | Conf={green}/{min_conf_final} | RR={rr:.2f} | Prob≈{prob_win:.2f}"
@@ -959,16 +1032,14 @@ def make_advice(
     trend_strength = float(row.get("TrendStrength", np.nan))
 
     rationale = {
-        # keep "score" for UI compatibility + add sub-scores:
         "score": total_score,
         "score_total": total_score,
         "score_tech": tech_score,
         "score_fundamentals": fund_score,
-        "components": breakdown,              # technical components
-        "fundamentals": fund_break,           # fundamentals breakdown
+        "components": breakdown,
+        "fundamentals": fund_break,
         "prob_win_est": round(prob_win, 3),
         "trend_strength": trend_strength,
-
         "rr_est": round(rr, 2),
         "goal": use_goal,
         "atr": round(atr, 4),
@@ -980,11 +1051,15 @@ def make_advice(
         "reasons": reasons,
         "sentiment_factor": breakdown.get("sentiment_factor"),
         "headlines_used": recent_headlines_for(symbol_for_sentiment or "", limit=8),
-        "sector_comparison": sector_cmp,         # new sector vs peers data
+        "sector_comparison": sector_cmp,
     }
+    feat_meta = getattr(d, "attrs", {}).get("feature_windows", {})
+    rationale["feature_windows"] = feat_meta  # for UI
+
+
 
     return AdviceResponse(
-        symbol="",  # UI sets this later
+        symbol="",
         as_of=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         decision=decision,
         rationale=rationale,
@@ -997,32 +1072,16 @@ def make_advice(
         est_reward_risk=round(rr, 2),
     )
 
-# -------- Routes --------
-@app.get("/", include_in_schema=False)
-def root_redirect():
-    return RedirectResponse(url="/dashboard", status_code=307)
+# ==========================
+# Routes
+# ==========================
+@app.api_route("/", methods=["GET", "HEAD"])
+def root_head():
+    return Response(content=_to_jsonable({"ok": True, "version": APP_VERSION}), media_type="application/json")
 
-@app.get("/health", include_in_schema=False)
-def health():
-    return {"ok": True, "status": "up"}
-
-def root():
-    return json_ok({
-        "ok": True,
-        "endpoints": {
-            "POST /advice": "Get advice for a symbol",
-            "POST /scan": "Rank a list of symbols",
-            "POST /news/auto_refresh": "Fetch latest headlines for symbols + market",
-            "POST /news/ingest": "Manually add headlines (optional)",
-            "POST /news/clear": "Clear stored headlines",
-            "POST /news/list": "List headlines + aggregate sentiment",
-            "POST /explain": "Explain features/score on a date",
-            "GET /dashboard": "Simple UI for scan + news refresh",
-            "GET /logs/recent": "Ring-buffer logs",
-            "GET /symbols/resolve": "Resolve a human name to a ticker",
-        },
-        "note": "Pass .NS/.BO for India via Yahoo. Or use data_csv with your own OHLCV file.",
-    })
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z", "version": APP_VERSION}
 
 @app.get("/symbols/resolve")
 def symbols_resolve(q: str):
@@ -1044,8 +1103,11 @@ def advice(req: AdviceRequest):
     log.info("\n" + "-"*70)
     log.info(f"{C_INFO} ADVICE request for {sym_disp} | wallet=₹{req.wallet:.0f} | risk={req.risk_level} | conf≥{req.min_confluence}")
     df = load_ohlcv(req.symbol, req.data_csv)
-    auto_fetch_market_headlines(max_items=12)
-    auto_fetch_headlines_for_symbol(req.symbol, max_items=8)
+    try:
+        auto_fetch_market_headlines(max_items=12)
+        auto_fetch_headlines_for_symbol(req.symbol, max_items=8)
+    except Exception as e:
+        log.info(f"{C_WARN} News fetch skipped: {e}")
     res = make_advice(
         df,
         req.goal,
@@ -1069,7 +1131,6 @@ def explain(req: ExplainRequest):
             raise HTTPException(404, "No rows up to that date.")
     row = d.iloc[-1]
     tech_score, parts = score_signal(row, goal="swing", symbol_for_sentiment=req.symbol)
-    # fundamentals (optional in explain)
     fin = get_fundamentals(req.symbol)
     fscore, fbreak = score_fundamentals(fin)
     total = round(0.8 * tech_score + 0.2 * fscore, 2)
@@ -1119,7 +1180,7 @@ def news_list(req: AutoNewsRequest):
     symbols = [normalize_symbol_for_india(s).split(".")[0] for s in (req.symbols or [])]
     symbols = list({*(symbols or []), "*"})  # include market by default
     out = []
-    for it in NEWS_DB[-500:][::-1]:  # newest-first
+    for it in NEWS_DB[-500:][::-1]:
         sym = str(it.get("symbol", "*")).upper()
         if sym in symbols:
             h = str(it.get("headline", ""))

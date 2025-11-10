@@ -1,13 +1,31 @@
-.git
-.gitignore
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.db
-.venv/
+*.sqlite3
+
+# Venvs
 .env
-*.log
+.venv/
+venv/
+
+# Caches
+.cache/
+pip-wheel-metadata/
+pytest_cache/
+.mypy_cache/
+.pytype/
+
+# Node, if any
+node_modules/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Data you don’t want in image
 data/*.csv
-dist/
-build/
+logs/

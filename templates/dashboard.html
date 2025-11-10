@@ -10,24 +10,38 @@
       --chip:#f1f5f9; --btn:#0f172a; --btnfg:#fff; --card:#ffffff; --bg:#fafafa; --accent:#2563eb;
     }
     *{box-sizing:border-box}
-    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;color:var(--c);background:var(--bg)}
-    .container{max-width:1100px;margin:0 auto;padding:18px}
-    .topbar{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.8);backdrop-filter:blur(8px);border-bottom:1px solid var(--b)}
-    .topbar-inner{max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 18px}
+    html,body{height:100%}
+    body{
+      font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      margin:0;color:var(--c);background:var(--bg);
+      overflow-x:hidden; /* never horizontal scroll for whole page */
+    }
+    .container{max-width:1200px;margin:0 auto;padding:18px}
+    .topbar{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.85);backdrop-filter:blur(8px);border-bottom:1px solid var(--b)}
+    .topbar-inner{max-width:1200px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 18px}
     .badge{font-size:.8rem;padding:.2rem .5rem;border:1px solid var(--b);border-radius:999px;background:#fff}
-    .row{display:grid;gap:14px;grid-template-columns:1.2fr 1fr}
+
+    /* Two-column layout: results get room (2fr) and news stays readable (1fr) */
+    .row{display:grid;gap:16px;grid-template-columns:2fr 1fr;align-items:start}
     .box{border:1px solid var(--b);border-radius:14px;padding:14px;background:var(--card);box-shadow:0 1px 0 rgba(0,0,0,.03)}
     .muted{color:var(--muted)}
     input,select,button{padding:.6rem .8rem;border:1px solid var(--b);border-radius:10px;background:#fff}
     input:focus,select:focus,button:focus{outline:none;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
-    table{border-collapse:collapse;width:100%}
-    th,td{border-bottom:1px solid var(--b);padding:.55rem .6rem;text-align:left;vertical-align:top}
-    th{position:sticky;top:0;background:#fff;z-index:1}
+
+    /* Table */
+    table{border-collapse:collapse;width:100%;table-layout:fixed} /* fixed + wrap prevents overflow */
+    th,td{
+      border-bottom:1px solid var(--b);padding:.55rem .6rem;text-align:left;vertical-align:top;
+      word-wrap:break-word;overflow-wrap:anywhere; /* long symbols/news won't blow layout */
+    }
+    th{background:#fff;z-index:1}
+
     .chips{display:flex;gap:8px;flex-wrap:wrap}
     .chip{background:var(--chip);border-radius:999px;padding:.2rem .6rem;font-size:.85rem;border:1px solid var(--b)}
     .tag{display:inline-block;padding:.16rem .5rem;border:1px solid var(--b);border-radius:999px;font-size:.8rem;background:#fff}
     .btn{background:var(--btn);color:var(--btnfg);border:0;padding:.6rem .9rem;border-radius:10px;cursor:pointer;display:inline-flex;align-items:center;gap:8px}
     .btn.secondary{background:#fff;color:var(--c);border:1px solid var(--b)}
+    .btn.ghost{background:transparent;color:var(--c);border:1px dashed var(--b)}
     .btn[disabled]{opacity:.6;cursor:not-allowed}
     .flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
@@ -63,7 +77,29 @@
     .legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
     .legend .dotl{width:10px;height:10px;border-radius:2px;display:inline-block;vertical-align:middle;margin-right:6px}
 
-    @media (max-width:980px){ .row{grid-template-columns:1fr} }
+    /* Keep table scroll INSIDE the card, not the whole page */
+    .table-wrap{
+      display:block;
+      max-width:100%;
+      overflow:auto;           /* internal horizontal/vertical scroll if needed */
+      border:1px solid var(--b);
+      border-radius:12px;
+    }
+    /* small min-width so columns stay readable, but won’t push page */
+    .table-wrap table{min-width:720px}
+
+    /* News list: readable and never squeezed; long lines wrap */
+    #news_list{max-height:420px;overflow:auto}
+    #news_list .chip{white-space:nowrap}
+    #news_list div{word-break:break-word}
+
+    /* Mobile responsiveness */
+    @media (max-width:1060px){
+      .container{padding:12px}
+      .row{grid-template-columns:1fr}
+      .grid2{grid-template-columns:1fr}
+      .term-body{max-height:280px}
+    }
   </style>
 </head>
 <body>
@@ -99,7 +135,7 @@
           <summary><b>What is Confluence, Sentiment, Risk?</b></summary>
           <ul style="margin:.4rem 0 .2rem 1rem">
             <li><b>Confluence</b>: <code class="kbd">Trend</code> (SMA20&gt;SMA50&gt;SMA200) + <code class="kbd">Momentum</code> (ROC10/50) + <code class="kbd">Volume</code> (&gt;1.2×MA20) + <code class="kbd">Sentiment</code> (&gt;0).</li>
-            <li><b>Sentiment</b>: time-decayed from market + stock headlines.</li>
+            <li><b>Sentiment</b>: time-decayed from market + stock/ETF headlines.</li>
             <li><b>Risk</b>: combines daily % cap and capped Kelly by win-prob & RR.</li>
           </ul>
         </details>
@@ -107,35 +143,42 @@
     </div>
 
     <div class="row" style="margin-top:14px">
+      <!-- Left: Scan + Results (wide) -->
       <div class="box">
         <h3>Scan Watchlist</h3>
         <form onsubmit="return runScan(event)">
           <div class="grid2">
-            <input id="syms" placeholder="RELIANCE, TCS, HDFCBANK" />
+            <input id="syms" placeholder="RELIANCE, TCS, HDFCBANK or ETFs like NIFTYBEES, BANKBEES" autocomplete="off" />
             <div class="flex">
-              <span>Wallet ₹: <input id="wallet" type="number" value="100000" style="width:10rem"></span>
+              <span>Wallet ₹: <input id="wallet" type="number" value="100000" style="width:10rem" inputmode="numeric"></span>
               <span>Risk:
                 <select id="risk"><option>low</option><option selected>medium</option><option>high</option></select>
               </span>
               <span>Min conf:
-                <input id="conf" type="number" value="3" min="1" max="4" style="width:4rem">
+                <input id="conf" type="number" value="3" min="1" max="4" style="width:4rem" inputmode="numeric">
               </span>
             </div>
           </div>
           <div class="flex" style="margin-top:.7rem">
             <button id="scanBtn" class="btn"><span class="spinner" style="display:none"></span>Run Scan</button>
             <button type="button" class="btn secondary" onclick="quickSetNifty50()">NIFTY50 (popular)</button>
+            <button type="button" class="btn secondary" onclick="quickSetEtfSnapshot()">Market ETFs (snapshot)</button>
+            <button type="button" class="btn ghost" onclick="quickSetETFs()">ETFs (NIFTYBEES, BANKBEES, JUNIORBEES)</button>
+            <button type="button" class="btn ghost" onclick="copyShare()">Copy share link</button>
             <span id="scanNote" class="muted"></span>
           </div>
         </form>
-        <div id="results" style="margin-top:10px;overflow:auto;max-height:420px"></div>
+
+        <!-- Results table scrolls inside this wrapper; page width never grows -->
+        <div class="table-wrap" id="results" style="margin-top:10px;max-height:440px"></div>
       </div>
 
+      <!-- Right: News (never squeezed; wraps text) -->
       <div class="box">
         <h3>Latest Headlines & Sentiment</h3>
         <form onsubmit="return fetchNews(event)">
           <div class="grid2">
-            <input id="news_syms" placeholder="RELIANCE, TCS, HDFCBANK" />
+            <input id="news_syms" placeholder="RELIANCE, TCS, HDFCBANK, NIFTYBEES" autocomplete="off" />
             <div class="flex">
               <button id="newsBtn" class="btn"><span class="spinner" style="display:none"></span>Fetch</button>
               <span id="news_status" class="muted"></span>
@@ -143,7 +186,7 @@
           </div>
         </form>
         <div id="agg_sent" class="chips" style="margin-top:.6rem"></div>
-        <div id="news_list" style="margin-top:8px;max-height:260px;overflow:auto"></div>
+        <div id="news_list" style="margin-top:8px"></div>
       </div>
     </div>
 
@@ -155,6 +198,9 @@
           <span id="logStatus" class="pill" style="margin-left:auto">idle</span>
         </div>
         <div id="log" class="term-body"></div>
+      </div>
+      <div class="mini muted" style="margin-top:6px">
+        Health check: <a href="/healthz">/healthz</a> • Logs: <code class="kbd">/logs/recent</code>
       </div>
     </div>
   </div>
@@ -188,6 +234,7 @@
 <script>
 let LAST_RESULTS = []; // store objects; no JSON inside HTML
 
+/* ---------- Small helpers ---------- */
 function setLoading(btn, loading, label=""){
   if(!btn) return;
   const spin = btn.querySelector('.spinner');
@@ -207,9 +254,57 @@ function quickSetNifty50(){
   const sample = "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, LT, ITC, SBIN, BHARTIARTL, AXISBANK, ASIANPAINT, KOTAKBANK, MARUTI, HUL, BAJFINANCE";
   document.getElementById('syms').value = sample;
 }
+function quickSetEtfSnapshot(){
+  const etfs = ["NIFTYBEES","BANKBEES","JUNIORBEES","MIDCAPBEES","ITBEES","PHARMABEES","TATAGOLD"];
+  document.getElementById('syms').value = etfs.join(', ');
+}
+function quickSetETFs(){
+  const sample = "NIFTYBEES, BANKBEES, JUNIORBEES, MIDCAPBEES, ITBEES, PHARMABEES";
+  document.getElementById('syms').value = sample;
+}
+function copyShare(){
+  const syms = document.getElementById('syms').value.trim();
+  const wallet = document.getElementById('wallet').value.trim();
+  const risk = document.getElementById('risk').value;
+  const conf = document.getElementById('conf').value.trim();
+  const url = new URL(location.href);
+  url.searchParams.set('syms', syms);
+  url.searchParams.set('wallet', wallet);
+  url.searchParams.set('risk', risk);
+  url.searchParams.set('conf', conf);
+  navigator.clipboard.writeText(url.toString()).then(()=> {
+    document.getElementById('scanNote').textContent = "Link copied!";
+  });
+}
 
+/* ---------- Persist/restore last scan (localStorage) ---------- */
+(function restore(){
+  try{
+    const qs = new URLSearchParams(location.search);
+    const s = qs.get('syms') ?? localStorage.getItem('sa_syms') ?? '';
+    const w = qs.get('wallet') ?? localStorage.getItem('sa_wallet') ?? '100000';
+    const r = qs.get('risk') ?? localStorage.getItem('sa_risk') ?? 'medium';
+    const c = qs.get('conf') ?? localStorage.getItem('sa_conf') ?? '3';
+    document.getElementById('syms').value = s;
+    document.getElementById('wallet').value = w;
+    document.getElementById('risk').value = r;
+    document.getElementById('conf').value = c;
+    // No auto-scan; user presses Run Scan
+  }catch(_){}
+})();
+function persistScanInputs(){
+  try{
+    localStorage.setItem('sa_syms', document.getElementById('syms').value.trim());
+    localStorage.setItem('sa_wallet', document.getElementById('wallet').value.trim());
+    localStorage.setItem('sa_risk', document.getElementById('risk').value);
+    localStorage.setItem('sa_conf', document.getElementById('conf').value.trim());
+  }catch(_){}
+}
+
+/* ---------- Scan ---------- */
 async function runScan(ev){
   if(ev) ev.preventDefault();
+  persistScanInputs();
   const syms = document.getElementById('syms').value.split(',').map(s=>s.trim()).filter(Boolean);
   const wallet = parseFloat(document.getElementById('wallet').value||'0');
   const risk = document.getElementById('risk').value;
@@ -224,7 +319,12 @@ async function runScan(ev){
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({symbols:syms,wallet:wallet,risk_level:risk,min_confluence:conf})
     });
-    const data = await r.json();
+    let data = {};
+    try { data = await r.json(); }
+    catch(parseErr){
+      note.textContent = "Failed: response not JSON (server busy). Try again.";
+      return false;
+    }
     LAST_RESULTS = Array.isArray(data.results) ? data.results : [];
     renderResults(LAST_RESULTS);
     note.textContent = "Done.";
@@ -245,6 +345,7 @@ async function runScan(ev){
   return false;
 }
 
+/* ---------- Results ---------- */
 function renderResults(items){
   const rows = (items||[]).map((x, idx)=>{
     if(x.error){
@@ -263,6 +364,7 @@ function renderResults(items){
     const sent = (x.rationale && (x.rationale.sentiment_factor ?? x.rationale.components?.sentiment_factor));
     const sentChip = (sent===undefined) ? '' : `<span class="tag" title="Sentiment used">Sent: ${Number(sent).toFixed(2)}</span>`;
     const rrChip = (x.est_reward_risk!==undefined) ? `<span class="tag" title="RR estimate">RR: ${Number(x.est_reward_risk).toFixed(2)}</span>` : '';
+
     const flags = (x.rationale && x.rationale.flags) || {};
     const confChips = `
       <span class="tag" title="Trend ok?">${flags.trend_ok ? '✅' : '❌'} Trend</span>
@@ -296,35 +398,19 @@ document.getElementById('results').addEventListener('click', (e)=>{
   if(Number.isFinite(idx) && LAST_RESULTS[idx]) showDetails(LAST_RESULTS[idx]);
 });
 
-function openDetails(){
-  const modal = document.getElementById('detailModal');
-  modal.style.display = 'flex';
-  modal.setAttribute('aria-hidden','false');
-}
-function closeDetails(){
-  const modal = document.getElementById('detailModal');
-  modal.style.display = 'none';
-  modal.setAttribute('aria-hidden','true');
-}
+/* ---------- Modal ---------- */
+function openDetails(){ const m=document.getElementById('detailModal'); m.style.display='flex'; m.setAttribute('aria-hidden','false'); }
+function closeDetails(){ const m=document.getElementById('detailModal'); m.style.display='none'; m.setAttribute('aria-hidden','true'); }
 
 /* ---------- Details rendering (with Fundamentals + Health) ---------- */
-function escapeHtml(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function pct(x, min=0, max=100){ const v=Math.max(min,Math.min(max,Number(x)||0)); return v; }
+function chipColor(val){ if(val==="better")return'background:#dcfce7;color:#166534'; if(val==="worse")return'background:#fee2e2;color:#991b1b'; return'background:#f1f5f9;color:#475569'; }
 
-function pct(x, min=0, max=100){ const v = Math.max(min, Math.min(max, Number(x)||0)); return v; }
-
-function chipColor(val){
-  if(val === "better") return 'background:#dcfce7;color:#166534';  // green
-  if(val === "worse")  return 'background:#fee2e2;color:#991b1b';  // red
-  return 'background:#f1f5f9;color:#475569';                      // neutral
-}
-
-// Compute overall health (0..100)
 function computeHealth(r){
   const tech = Number(r.score_tech ?? r.score ?? 0);
-  const fund = Number(r.score_fundamentals ?? 0) * 5;           // 0..20 -> 0..100
-  const sent = Number((r.sentiment_factor ?? 0) * 50 + 50);     // -1..1 -> 0..100
+  const fund = Number(r.score_fundamentals ?? 0) * 5;
+  const sent = Number((r.sentiment_factor ?? 0) * 50 + 50);
   const regime = (r.nifty_regime && r.nifty_regime.regime==='UP') ? 100 : 40;
   const score = (0.4*tech) + (0.3*fund) + (0.2*sent) + (0.1*regime);
   return Math.round(pct(score, 0, 100));
@@ -332,113 +418,73 @@ function computeHealth(r){
 
 function fundamentalsChips(fb){
   if(!fb || fb.ok===false) return '<div class="muted">No fundamentals available.</div>';
-  const get = (k)=> fb[k];
-  const yes = (cond)=> cond ? '✅' : '❌';
-  const chips = [];
-
-  const pe = get('PE_used');
-  if(pe!=null) chips.push(`<span class="chip" title="PE used (trailing/forward min)">PE: <b>${Number(pe).toFixed(2)}</b> ${yes(pe<25)}</span>`);
-
-  const roe = get('ROE');
-  if(roe!=null) chips.push(`<span class="chip" title="Return on Equity">${roe>0.15?'✅':'❌'} ROE: <b>${(roe*100).toFixed(1)}%</b></span>`);
-
-  const de = get('DebtToEquity');
-  if(de!=null) chips.push(`<span class="chip" title="Debt to Equity">${de<1?'✅':'❌'} D/E: <b>${Number(de).toFixed(2)}</b></span>`);
-
-  const pm = get('ProfitMargins');
-  if(pm!=null) chips.push(`<span class="chip" title="Net Profit Margin">${pm>0.10?'✅':'❌'} Margin: <b>${(pm*100).toFixed(1)}%</b></span>`);
-
-  const gr = get('Growth');
-  if(gr!=null) chips.push(`<span class="chip" title="Revenue/Earnings growth ${gr>0.05?'>5%':''}">${gr>0.05?'✅':'❌'} Growth: <b>${(gr*100).toFixed(1)}%</b></span>`);
-
-  const peg = get('PEG');
-  if(peg!=null) chips.push(`<span class="chip" title="PEG ratio">${peg<1.5?'✅':'❌'} PEG: <b>${Number(peg).toFixed(2)}</b></span>`);
-
-  const raw = fb.raw_points_0_30, norm = fb.norm_0_20;
-  chips.push(`<span class="chip" title="Raw fundamentals points">${raw!=null?`Raw: ${raw}`:'Raw: –'}</span>`);
-  chips.push(`<span class="chip" title="Normalized 0..20">Fundamentals Score: <b>${norm!=null?norm:'–'}/20</b></span>`);
-
-  const rules = Array.isArray(fb.rules) ? fb.rules : [];
+  const get=(k)=>fb[k], yes=(c)=>c?'✅':'❌', chips=[];
+  const pe=get('PE_used'); if(pe!=null) chips.push(`<span class="chip">PE: <b>${Number(pe).toFixed(2)}</b> ${yes(pe<25)}</span>`);
+  const roe=get('ROE'); if(roe!=null) chips.push(`<span class="chip">${roe>0.15?'✅':'❌'} ROE: <b>${(roe*100).toFixed(1)}%</b></span>`);
+  const de=get('DebtToEquity'); if(de!=null) chips.push(`<span class="chip">${de<1?'✅':'❌'} D/E: <b>${Number(de).toFixed(2)}</b></span>`);
+  const pm=get('ProfitMargins'); if(pm!=null) chips.push(`<span class="chip">${pm>0.10?'✅':'❌'} Margin: <b>${(pm*100).toFixed(1)}%</b></span>`);
+  const gr=get('Growth'); if(gr!=null) chips.push(`<span class="chip">${gr>0.05?'✅':'❌'} Growth: <b>${(gr*100).toFixed(1)}%</b></span>`);
+  const peg=get('PEG'); if(peg!=null) chips.push(`<span class="chip">${peg<1.5?'✅':'❌'} PEG: <b>${Number(peg).toFixed(2)}</b></span>`);
+  const raw=fb.raw_points_0_30, norm=fb.norm_0_20;
+  chips.push(`<span class="chip">${raw!=null?`Raw: ${raw}`:'Raw: –'}</span>`);
+  chips.push(`<span class="chip">Fundamentals Score: <b>${norm!=null?norm:'–'}/20</b></span>`);
+  const rules=Array.isArray(fb.rules)?fb.rules:[];
   const rulesHtml = rules.length ? rules.map(r=>`<li>${escapeHtml(`${r.factor}: ${r.value} (${r.bonus})`)}</li>`).join('') : '<li class="muted">No rule bonuses triggered.</li>';
-
-  return `
-    <div class="chips" style="margin-top:6px">${chips.join('')}</div>
-    <details style="margin-top:8px"><summary><b>Fundamental rule hits</b></summary>
-      <ul style="margin:.4rem 0 .2rem 1rem">${rulesHtml}</ul>
-    </details>
-  `;
+  return `<div class="chips" style="margin-top:6px">${chips.join('')}</div>
+          <details style="margin-top:8px"><summary><b>Fundamental rule hits</b></summary>
+          <ul style="margin:.4rem 0 .2rem 1rem">${rulesHtml}</ul></details>`;
 }
 
 function showDetails(x){
   document.getElementById('d_title').innerText = `Details — ${x.symbol||''} (${x.decision})`;
-  const r = x.rationale||{};
-  const comp = r.components||{};
-  const fund = r.fundamentals || {};
-  const tgs = (x.targets||[]).map(t=>`${t.label}: ₹${t.price}`).join(', ');
-  const parts = Object.entries(comp).map(([k,v])=>`<li><b>${k}</b>: ${v}</li>`).join('');
-  const rr = r.rr_est!==undefined ? r.rr_est : x.est_reward_risk;
-  const prob = r.prob_win_est!==undefined ? r.prob_win_est : '-';
+  const r=x.rationale||{}, comp=r.components||{}, fund=r.fundamentals||{};
+  const tgs=(x.targets||[]).map(t=>`${t.label}: ₹${t.price}`).join(', ');
+  const parts=Object.entries(comp).map(([k,v])=>`<li><b>${k}</b>: ${v}</li>`).join('');
+  const rr=r.rr_est!==undefined?r.rr_est:x.est_reward_risk;
+  const prob=r.prob_win_est!==undefined?r.prob_win_est:'-';
 
-  // Health bar + breakdown
-  const H = computeHealth(r);
-  document.getElementById('healthLabel').textContent = `${H}/100`;
-  document.getElementById('healthBar').style.width = `${H}%`;
-  document.getElementById('healthBreak').innerHTML = `
-    <span class="chip">Tech: <b>${Number(r.score_tech ?? r.score ?? 0).toFixed(1)}</b></span>
-    <span class="chip">Fund: <b>${Number(r.score_fundamentals ?? 0).toFixed(1)}/20</b></span>
-    <span class="chip">Sent: <b>${Number(r.sentiment_factor ?? comp.sentiment_factor ?? 0).toFixed(2)}</b></span>
-    <span class="chip">Regime: <b>${(r.nifty_regime && r.nifty_regime.regime) || '-'}</b></span>
-  `;
+  const H=computeHealth(r);
+  document.getElementById('healthLabel').textContent=`${H}/100`;
+  document.getElementById('healthBar').style.width=`${H}%`;
+  document.getElementById('healthBreak').innerHTML=
+    `<span class="chip">Tech: <b>${Number(r.score_tech ?? r.score ?? 0).toFixed(1)}</b></span>
+     <span class="chip">Fund: <b>${Number(r.score_fundamentals ?? 0).toFixed(1)}/20</b></span>
+     <span class="chip">Sent: <b>${Number(r.sentiment_factor ?? comp.sentiment_factor ?? 0).toFixed(2)}</b></span>
+     <span class="chip">Regime: <b>${(r.nifty_regime && r.nifty_regime.regime) || '-'}</b></span>`;
 
-  // Headlines used
-  const heads = Array.isArray(r.headlines_used) ? r.headlines_used : [];
+  const heads = Array.isArray(r.headlines_used)?r.headlines_used:[];
   const headsHtml = heads.length ? heads.map(h=>{
-    const s = h.symbol==='*' ? 'MARKET' : h.symbol;
-    const scls = (h.sentiment>0 ? 'ok' : (h.sentiment<0 ? 'err' : 'muted'));
-    return `<div style="margin:.3rem 0">
-      <span class="chip">${s}</span>
-      <span class="${scls}">${h.headline}</span>
-      <span class="muted" style="float:right">${h.ts||''}</span>
-    </div>`;
+    const s=h.symbol==='*'?'MARKET':h.symbol;
+    const scls=(h.sentiment>0?'ok':(h.sentiment<0?'err':'muted'));
+    return `<div style="margin:.3rem 0"><span class="chip">${s}</span>
+            <span class="${scls}">${h.headline}</span>
+            <span class="muted" style="float:right">${h.ts||''}</span></div>`;
   }).join('') : '<div class="muted">No headlines considered.</div>';
 
-  const sent = (r.sentiment_factor ?? comp.sentiment_factor);
-  const sentChip = (sent===undefined) ? '' : `<span class="chip">Sentiment used: <b>${Number(sent).toFixed(2)}</b></span>`;
-
-  const flags = r.flags || {};
-  const reasons = Array.isArray(r.reasons) ? r.reasons : [];
-
-  // Sector comparison chips (better/worse/-)
-  const sec = r.sector_comparison || {};
-  const secHtml = `
-    <div class="chips" style="margin-top:4px">
+  const flags=r.flags||{}, reasons=Array.isArray(r.reasons)?r.reasons:[];
+  const sec=r.sector_comparison||{};
+  const secHtml = `<div class="chips" style="margin-top:4px">
       <span class="chip" style="${chipColor(sec.pe_vs_sector)}">PE vs peers: <b>${sec.pe_vs_sector ?? "-"}</b></span>
       <span class="chip" style="${chipColor(sec.roe_vs_sector)}">ROE vs peers: <b>${sec.roe_vs_sector ?? "-"}</b></span>
       <span class="chip" style="${chipColor(sec.de_vs_sector)}">D/E vs peers: <b>${sec.de_vs_sector ?? "-"}</b></span>
     </div>
     <div class="mini muted" style="margin-top:4px">
       Sector: ${sec.sector || "Unknown"} • Industry: ${sec.industry || "Unknown"}
-    </div>
-  `;
+    </div>`;
 
-  document.getElementById('d_body').innerHTML = `
-    <div class="chips">
+  document.getElementById('d_body').innerHTML =
+    `<div class="chips">
       <span class="chip">Score: <b>${r.score_total ?? r.score ?? '-'}</b></span>
       <span class="chip">Conf: <b>${r.confluence ?? '-'}/${r.min_confluence ?? '-'}</b></span>
       <span class="chip">RR est: <b>${rr}</b></span>
       <span class="chip">Win Prob≈ <b>${prob}</b></span>
       <span class="chip">ATR: <b>${r.atr ?? '-'}</b></span>
       <span class="chip">Goal: <b>${r.goal ?? '-'}</b></span>
-      ${sentChip}
     </div>
-
-    <div style="margin-top:8px">
-      <b>Entry/Stops/Targets:</b>
+    <div style="margin-top:8px"><b>Entry/Stops/Targets:</b>
       <div>Entry: ₹${x.entry_price} | Stop: ₹${x.stop_loss} | Targets: ${tgs} | Qty: ${x.position_qty}</div>
     </div>
-
-    <div style="margin-top:8px">
-      <b>Confluence checks:</b>
+    <div style="margin-top:8px"><b>Confluence checks:</b>
       <div class="chips">
         <span class="chip">${flags.trend_ok ? '✅' : '❌'} Trend</span>
         <span class="chip">${flags.momentum_ok ? '✅' : '❌'} Momentum</span>
@@ -446,114 +492,77 @@ function showDetails(x){
         <span class="chip">${flags.sentiment_ok ? '✅' : '❌'} Sentiment</span>
       </div>
     </div>
-
-    <div style="margin-top:8px">
-      <b>Technical components:</b>
-      <ul>${parts}</ul>
-    </div>
-
-    <div style="margin-top:8px">
-      <b>Trend Strength:</b>
-      <span class="chip" style="background:#e0f2fe;color:#0369a1">${r.trend_strength ? r.trend_strength.toFixed(1) + "%" : "-"}</span>
-      <span class="muted">${r.trend_strength >= 70 ? "▲▲▲ Strong" : (r.trend_strength >= 40 ? "▲ Medium" : "– Weak")}</span>
-    </div>
-
-    <div style="margin-top:8px">
-      <b>Fundamentals:</b>
-      ${fundamentalsChips(fund)}
-    </div>
-
-    <div style="margin-top:8px">
-      <b>Sector Comparison:</b>
-      ${secHtml}
-    </div>
-
-    <div style="margin-top:8px">
-      <b>Market Regime:</b>
+    <div style="margin-top:8px"><b>Technical components:</b><ul>${parts}</ul></div>
+    <div style="margin-top:8px"><b>Fundamentals:</b>${fundamentalsChips(fund)}</div>
+    <div style="margin-top:8px"><b>Sector Comparison:</b>${secHtml}</div>
+    <div style="margin-top:8px"><b>Market Regime:</b>
       <pre class="logline" style="background:#f8fafc;border:1px solid var(--b);border-radius:8px;padding:8px">${escapeHtml(JSON.stringify(r.nifty_regime || {}, null, 2))}</pre>
     </div>
-
-    <div style="margin-top:8px">
-      <b>Why not BUY?</b>
+    <div style="margin-top:8px"><b>Why not BUY?</b>
       <ul>${reasons.length ? reasons.map(x=>`<li>${x}</li>`).join('') : '<li class="muted">No blockers.</li>'}</ul>
     </div>
-
-    <div style="margin-top:8px">
-      <b>Headlines considered in score:</b>
+    <div style="margin-top:8px"><b>Headlines considered in score:</b>
       <div style="max-height:200px;overflow:auto;border:1px solid var(--b);border-radius:10px;padding:8px">${headsHtml}</div>
-    </div>
-  `;
+    </div>`;
   openDetails();
 }
 
 /* ---------- News & Logs ---------- */
 async function fetchNews(ev){
   if(ev) ev.preventDefault();
-  const btn = document.getElementById('newsBtn');
-  const syms = document.getElementById('news_syms').value.split(',').map(s=>s.trim()).filter(Boolean);
-  const statusEl = document.getElementById('news_status');
+  const btn=document.getElementById('newsBtn');
+  const syms=document.getElementById('news_syms').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const statusEl=document.getElementById('news_status');
   try{
-    setLoading(btn, true, "Fetching...");
-    statusEl.textContent = "";
-    const r = await fetch('/news/list', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({symbols:syms, max_per_symbol:8})
-    });
-    const data = await r.json();
-    statusEl.textContent = data.ok ? `Loaded ${data.headlines?.length||0}` : 'Failed';
-    const agg = data.aggregate || {};
-    document.getElementById('agg_sent').innerHTML = Object.entries(agg).map(([k,v])=>{
-      const cls = v>0 ? 'ok' : (v<0 ? 'err' : 'muted');
-      const label = k==='*' ? 'MARKET' : k;
+    setLoading(btn,true,"Fetching...");
+    statusEl.textContent="";
+    const r=await fetch('/news/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbols:syms,max_per_symbol:8})});
+    let data={}; try{ data=await r.json(); }catch(_){ statusEl.textContent="Failed: response not JSON"; return false; }
+    statusEl.textContent=data.ok?`Loaded ${data.headlines?.length||0}`:'Failed';
+    const agg=data.aggregate||{};
+    document.getElementById('agg_sent').innerHTML=Object.entries(agg).map(([k,v])=>{
+      const cls=v>0?'ok':(v<0?'err':'muted'); const label=k==='*'?'MARKET':k;
       return `<span class="chip">Sentiment ${label}: <b class="${cls}">${Number(v).toFixed(2)}</b></span>`;
     }).join('');
-    const newsHtml = (data.headlines||[]).slice(0,120).map(h=>{
-      const s = h.symbol==='*' ? 'MARKET' : h.symbol;
-      const scls = h.sentiment>0 ? 'ok' : (h.sentiment<0 ? 'err' : 'muted');
-      return `<div style="margin:.3rem 0">
-        <span class="chip">${s}</span>
-        <span class="${scls}">${h.headline}</span>
-        <span class="muted" style="float:right">${h.ts||''}</span>
-      </div>`;
+    const newsHtml=(data.headlines||[]).slice(0,120).map(h=>{
+      const s=h.symbol==='*'?'MARKET':h.symbol; const scls=h.sentiment>0?'ok':(h.sentiment<0?'err':'muted');
+      return `<div style="margin:.3rem 0"><span class="chip">${s}</span>
+              <span class="${scls}">${h.headline}</span>
+              <span class="muted" style="float:right">${h.ts||''}</span></div>`;
     }).join('');
-    document.getElementById('news_list').innerHTML = newsHtml || '<div class="muted">No headlines yet.</div>';
-  }catch(e){
-    statusEl.textContent = "Failed: " + (e?.message||e);
-  }finally{
-    setLoading(btn, false);
-  }
+    document.getElementById('news_list').innerHTML=newsHtml||'<div class="muted">No headlines yet.</div>';
+  }catch(e){ statusEl.textContent="Failed: "+(e?.message||e); }
+  finally{ setLoading(btn,false); }
   return false;
 }
 
 function colorize(line){
-  const safe = escapeHtml(line);
-  let out = safe.replace(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*/,'<span class="log-ts">[$1]</span> ');
-  out = out.replace(/✓/g,'<span class="log-ok">✓</span>');
-  out = out.replace(/✗/g,'<span class="log-err">✗</span>');
-  out = out.replace(/!/g,'<span class="log-warn">!</span>');
-  out = out.replace(/→/g,'<span class="log-info">→</span>');
-  out = out.replace(/\bDecision=BUY\b/g,'<span class="log-ok hl">Decision=BUY</span>');
-  out = out.replace(/\bDecision=HOLD\b/g,'<span class="log-warn hl">Decision=HOLD</span>');
-  out = out.replace(/\bDecision=AVOID\b/g,'<span class="log-err hl">Decision=AVOID</span>');
-  out = out.replace(/\bRR=\d+(\.\d+)?/g,'<span class="hl">$&</span>');
-  out = out.replace(/\bProb≈\s*\d+(\.\d+)?/g,'<span class="hl">$&</span>');
+  const safe=escapeHtml(line);
+  let out=safe.replace(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*/,'<span class="log-ts">[$1]</span> ');
+  out=out.replace(/✓/g,'<span class="log-ok">✓</span>');
+  out=out.replace(/✗/g,'<span class="log-err">✗</span>');
+  out=out.replace(/!/g,'<span class="log-warn">!</span>');
+  out=out.replace(/→/g,'<span class="log-info">→</span>');
+  out=out.replace(/\bDecision=BUY\b/g,'<span class="log-ok hl">Decision=BUY</span>');
+  out=out.replace(/\bDecision=HOLD\b/g,'<span class="log-warn hl">Decision=HOLD</span>');
+  out=out.replace(/\bDecision=AVOID\b/g,'<span class="log-err hl">Decision=AVOID</span>');
+  out=out.replace(/\bRR=\d+(\.\d+)?/g,'<span class="hl">$&</span>');
+  out=out.replace(/\bProb≈\s*\d+(\.\d+)?/g,'<span class="hl">$&</span>');
   return `<div class="logline">${out}</div>`;
 }
 async function pollLogs(){
-  const status = document.getElementById('logStatus');
+  const status=document.getElementById('logStatus');
   try{
-    status.textContent = 'polling';
-    const r = await fetch('/logs/recent?limit=800');
-    const data = await r.json();
-    const lines = (data.lines||[]);
-    const box = document.getElementById('log');
-    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 10;
-    box.innerHTML = lines.map(colorize).join('');
-    if(atBottom) box.scrollTop = box.scrollHeight;
-    status.textContent = 'ok';
-  }catch(e){
-    status.textContent = 'error';
-  }
+    status.textContent='polling';
+    const r=await fetch('/logs/recent?limit=800');
+    const data=await r.json();
+    const lines=(data.lines||[]);
+    const box=document.getElementById('log');
+    const atBottom=box.scrollTop + box.clientHeight >= box.scrollHeight - 10;
+    box.innerHTML=lines.map(colorize).join('');
+    if(atBottom) box.scrollTop=box.scrollHeight;
+    status.textContent='ok';
+  }catch(e){ status.textContent='error'; }
 }
 setInterval(pollLogs, 3000);
 pollLogs();
