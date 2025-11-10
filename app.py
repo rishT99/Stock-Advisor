@@ -5,6 +5,7 @@ import os, re, math
 from difflib import get_close_matches
 from datetime import datetime
 from typing import Optional, Literal, Dict, Any, List, Tuple
+from fastapi.responses import RedirectResponse
 
 import numpy as np
 import pandas as pd
@@ -997,7 +998,14 @@ def make_advice(
     )
 
 # -------- Routes --------
-@app.get("/")
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    return RedirectResponse(url="/dashboard", status_code=307)
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"ok": True, "status": "up"}
+
 def root():
     return json_ok({
         "ok": True,

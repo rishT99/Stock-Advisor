@@ -4,7 +4,8 @@ gunicorn==22.0.0
 pydantic==2.9.2
 pydantic-core==2.23.4
 jinja2==3.1.4
-numpy==1.26.4
+# numpy==1.
+numpy==1.26.4       # keep <=1.26 so it has manylinux wheels
 pandas==2.2.2
 yfinance==0.2.43
 feedparser==6.0.11
