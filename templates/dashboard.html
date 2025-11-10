@@ -36,7 +36,8 @@
     .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
     .kbd{font:12px ui-monospace,Menlo,Consolas,monospace;border:1px solid var(--b);border-bottom-width:2px;border-radius:8px;padding:.06rem .35rem;background:#f8fafc}
     .mini{font-size:.9rem}
-    /* Modal (overlay fix) */
+
+    /* Modal */
     #detailModal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;padding:12px;z-index:9999}
     #detailCard{background:#fff;max-width:860px;width:100%;border-radius:14px;border:1px solid var(--b);padding:16px;max-height:85vh;overflow:auto;position:relative;z-index:10000}
 
@@ -55,9 +56,12 @@
     .hl{background:rgba(37,99,235,.2);padding:0 .2rem;border-radius:4px}
     .pill{padding:.1rem .45rem;border-radius:999px;border:1px solid #334155;background:#111827;color:#e5e7eb;font-size:.75rem}
 
-    /* Health bar */
-    .health{height:10px;border-radius:999px;background:#e5e7eb;overflow:hidden;border:1px solid #d1d5db}
-    .health>div{height:100%;background:linear-gradient(90deg,#22c55e,#84cc16,#f59e0b,#ef4444)}
+    /* Health bar + legend */
+    .health{height:12px;border-radius:999px;background:#eef2f7;overflow:hidden;border:1px solid #d1d5db;position:relative}
+    .health>div{height:100%;background:linear-gradient(90deg,#ef4444 0%,#f59e0b 40%,#84cc16 60%,#22c55e 80%,#16a34a 100%)}
+    .ticks{display:flex;justify-content:space-between;font-size:.75rem;color:#475569;margin-top:6px}
+    .legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+    .legend .dotl{width:10px;height:10px;border-radius:2px;display:inline-block;vertical-align:middle;margin-right:6px}
 
     @media (max-width:980px){ .row{grid-template-columns:1fr} }
   </style>
@@ -67,7 +71,7 @@
     <div class="topbar-inner">
       <div class="flex">
         <strong>📈 Stock Advisor — India</strong>
-        <span class="badge mini">v3.2</span>
+        <span class="badge mini">v3.3</span>
       </div>
       <div id="topRegime" class="mini muted">Loading regime…</div>
     </div>
@@ -167,6 +171,13 @@
       <div id="healthWrap" style="margin:8px 0 12px">
         <div class="flex" style="justify-content:space-between"><b>Overall Health</b><span id="healthLabel" class="muted">–/100</span></div>
         <div class="health"><div id="healthBar" style="width:0%"></div></div>
+        <div class="ticks"><span>0</span><span>40</span><span>60</span><span>80</span><span>100</span></div>
+        <div class="legend">
+          <span><i class="dotl" style="background:#ef4444"></i>Weak (0-40)</span>
+          <span><i class="dotl" style="background:#f59e0b"></i>Fair (40-60)</span>
+          <span><i class="dotl" style="background:#84cc16"></i>Good (60-80)</span>
+          <span><i class="dotl" style="background:#16a34a"></i>Excellent (80-100)</span>
+        </div>
         <div id="healthBreak" class="chips" style="margin-top:6px"></div>
       </div>
 
@@ -303,14 +314,18 @@ function escapeHtml(s){
 
 function pct(x, min=0, max=100){ const v = Math.max(min, Math.min(max, Number(x)||0)); return v; }
 
-// Compute overall health (0..100) using returned subscores + sentiment + regime
-function computeHealth(r){
-  const tech = Number(r.score_tech ?? r.score ?? 0);            // ~0..100 in our scale
-  const fund = Number(r.score_fundamentals ?? 0) * 5;           // fund 0..20 -> 0..100
-  const sent = Number((r.sentiment_factor ?? 0) * 50 + 50);     // -1..1 -> 0..100 (linear map)
-  const regime = (r.nifty_regime && r.nifty_regime.regime==='UP') ? 100 : 40;
+function chipColor(val){
+  if(val === "better") return 'background:#dcfce7;color:#166534';  // green
+  if(val === "worse")  return 'background:#fee2e2;color:#991b1b';  // red
+  return 'background:#f1f5f9;color:#475569';                      // neutral
+}
 
-  // weights: tech 40%, fund 30%, sent 20%, regime 10%
+// Compute overall health (0..100)
+function computeHealth(r){
+  const tech = Number(r.score_tech ?? r.score ?? 0);
+  const fund = Number(r.score_fundamentals ?? 0) * 5;           // 0..20 -> 0..100
+  const sent = Number((r.sentiment_factor ?? 0) * 50 + 50);     // -1..1 -> 0..100
+  const regime = (r.nifty_regime && r.nifty_regime.regime==='UP') ? 100 : 40;
   const score = (0.4*tech) + (0.3*fund) + (0.2*sent) + (0.1*regime);
   return Math.round(pct(score, 0, 100));
 }
@@ -343,7 +358,6 @@ function fundamentalsChips(fb){
   chips.push(`<span class="chip" title="Raw fundamentals points">${raw!=null?`Raw: ${raw}`:'Raw: –'}</span>`);
   chips.push(`<span class="chip" title="Normalized 0..20">Fundamentals Score: <b>${norm!=null?norm:'–'}/20</b></span>`);
 
-  // Optional: list the rules that fired
   const rules = Array.isArray(fb.rules) ? fb.rules : [];
   const rulesHtml = rules.length ? rules.map(r=>`<li>${escapeHtml(`${r.factor}: ${r.value} (${r.bonus})`)}</li>`).join('') : '<li class="muted">No rule bonuses triggered.</li>';
 
@@ -365,7 +379,7 @@ function showDetails(x){
   const rr = r.rr_est!==undefined ? r.rr_est : x.est_reward_risk;
   const prob = r.prob_win_est!==undefined ? r.prob_win_est : '-';
 
-  // Health bar
+  // Health bar + breakdown
   const H = computeHealth(r);
   document.getElementById('healthLabel').textContent = `${H}/100`;
   document.getElementById('healthBar').style.width = `${H}%`;
@@ -393,6 +407,19 @@ function showDetails(x){
 
   const flags = r.flags || {};
   const reasons = Array.isArray(r.reasons) ? r.reasons : [];
+
+  // Sector comparison chips (better/worse/-)
+  const sec = r.sector_comparison || {};
+  const secHtml = `
+    <div class="chips" style="margin-top:4px">
+      <span class="chip" style="${chipColor(sec.pe_vs_sector)}">PE vs peers: <b>${sec.pe_vs_sector ?? "-"}</b></span>
+      <span class="chip" style="${chipColor(sec.roe_vs_sector)}">ROE vs peers: <b>${sec.roe_vs_sector ?? "-"}</b></span>
+      <span class="chip" style="${chipColor(sec.de_vs_sector)}">D/E vs peers: <b>${sec.de_vs_sector ?? "-"}</b></span>
+    </div>
+    <div class="mini muted" style="margin-top:4px">
+      Sector: ${sec.sector || "Unknown"} • Industry: ${sec.industry || "Unknown"}
+    </div>
+  `;
 
   document.getElementById('d_body').innerHTML = `
     <div class="chips">
@@ -426,8 +453,19 @@ function showDetails(x){
     </div>
 
     <div style="margin-top:8px">
+      <b>Trend Strength:</b>
+      <span class="chip" style="background:#e0f2fe;color:#0369a1">${r.trend_strength ? r.trend_strength.toFixed(1) + "%" : "-"}</span>
+      <span class="muted">${r.trend_strength >= 70 ? "▲▲▲ Strong" : (r.trend_strength >= 40 ? "▲ Medium" : "– Weak")}</span>
+    </div>
+
+    <div style="margin-top:8px">
       <b>Fundamentals:</b>
       ${fundamentalsChips(fund)}
+    </div>
+
+    <div style="margin-top:8px">
+      <b>Sector Comparison:</b>
+      ${secHtml}
     </div>
 
     <div style="margin-top:8px">

@@ -1,20 +1,3 @@
-"""
-Stock Advisor Bot — India-first (v3.2, Fundamentals Enhanced)
-
-What's new vs v3.1:
-- Fundamentals layer (Yahoo Finance .info) with a compact scoring model
-- Blended score: total = 0.8 * technical + 0.2 * fundamentals_norm
-- Rationale includes fundamentals details + subscore fields
-- Volume burst threshold relaxed (1.2× MA20 instead of 1.5×)
-- JSON-safe responses and global error handlers retained
-
-Run:
-  python -m venv .venv && .venv\Scripts\activate
-  pip install -r requirements.txt
-  uvicorn app:app --reload --port 8000
-
-Open: http://localhost:8000/dashboard
-"""
 from __future__ import annotations
 
 import logging
@@ -29,6 +12,25 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from ta.trend import adx
+# ---- Fundamentals cache (6h TTL) ----
+from time import time
+FUND_TTL_SEC = 6 * 3600
+FUND_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+PEER_INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+def _cache_get(cache: dict, key: str):
+    t = cache.get(key)
+    if not t: return None
+    ts, val = t
+    if time() - ts > FUND_TTL_SEC:
+        cache.pop(key, None)
+        return None
+    return val
+
+def _cache_put(cache: dict, key: str, val: dict):
+    cache[key] = (time(), val)
+
 
 # -------- Pretty logging --------
 try:
@@ -60,7 +62,7 @@ try:
 except Exception:
     feedparser = None
 
-app = FastAPI(title="Stock Advisor Bot — India v3.2")
+app = FastAPI(title="Stock Advisor Bot — India v3.3")
 templates = Jinja2Templates(directory="templates")
 
 # ==========================
@@ -347,6 +349,16 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
             d["RSI14"] = np.nan
     else:
         d["RSI14"] = np.nan
+
+    # --- Trend Strength (SMA slope + ADX) ---
+    try:
+        d["ADX14"] = adx(d["High"], d["Low"], d["Close"], window=14)
+        slope = (d["SMA50"].iloc[-1] - d["SMA50"].iloc[-10]) / 10
+        norm_slope = np.clip((slope / d["Close"].iloc[-1]) * 1000, -100, 100)
+        d["TrendStrength"] = np.clip((abs(norm_slope) + d["ADX14"].iloc[-1]) / 2, 0, 100)
+    except Exception:
+        d["TrendStrength"] = np.nan
+
     d = d.dropna()
     log.info(f"{C_OK} Features ready (rows={len(d)})")
     return d
@@ -475,27 +487,50 @@ def safe_get(info: dict, key: str, default=None):
         return default
 
 def get_fundamentals(symbol: str) -> Dict[str, Any]:
-    """Fetch a compact fundamentals dict from Yahoo Finance .info. Graceful on failure."""
+    """Compact fundamentals from Yahoo Finance with light normalization."""
     if yf is None or not symbol:
         return {"ok": False, "reason": "yfinance unavailable or empty symbol"}
+
+    ysym = normalize_symbol_for_india(symbol)
+    cached = _cache_get(FUND_CACHE, ysym)
+    if cached is not None:
+        return cached
+
     try:
-        ysym = normalize_symbol_for_india(symbol)
         info = yf.Ticker(ysym).info or {}
-        # Collate a small subset
+        # Pull raw values
+        trailingPE = safe_get(info, "trailingPE")
+        forwardPE = safe_get(info, "forwardPE")
+        pegRatio = safe_get(info, "pegRatio")
+        returnOnEquity = safe_get(info, "returnOnEquity")   # usually ratio (0..1)
+        debtToEquity_raw = safe_get(info, "debtToEquity")   # often percent!
+        profitMargins = safe_get(info, "profitMargins")     # ratio (0..1)
+        revenueGrowth = safe_get(info, "revenueGrowth")     # ratio (0..1)
+        eqGrowth = safe_get(info, "earningsQuarterlyGrowth")
+
+        # Normalize D/E: Yahoo typically reports percentage (e.g., 81.25 = 0.8125×)
+        de_ratio = None
+        if isinstance(debtToEquity_raw, (int, float)):
+            de_ratio = float(debtToEquity_raw)
+            if de_ratio > 10:  # treat as percent if it looks large
+                de_ratio = de_ratio / 100.0
+
         out = {
+            "ok": True,
             "symbol": ysym,
-            "trailingPE": safe_get(info, "trailingPE"),
-            "forwardPE": safe_get(info, "forwardPE"),
-            "pegRatio": safe_get(info, "pegRatio"),
-            "returnOnEquity": safe_get(info, "returnOnEquity"),
-            "debtToEquity": safe_get(info, "debtToEquity"),
-            "profitMargins": safe_get(info, "profitMargins"),
-            # growth proxies (may be None depending on source coverage)
-            "revenueGrowth": safe_get(info, "revenueGrowth"),
-            "earningsQuarterlyGrowth": safe_get(info, "earningsQuarterlyGrowth"),
-            "trailingEps": safe_get(info, "trailingEps"),
+            "trailingPE": trailingPE,
+            "forwardPE": forwardPE,
+            "pegRatio": pegRatio,
+            "returnOnEquity": returnOnEquity,
+            "debtToEquity": de_ratio,
+            "profitMargins": profitMargins,
+            "revenueGrowth": revenueGrowth,
+            "earningsQuarterlyGrowth": eqGrowth,
+            # pass through for sector comparisons
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
         }
-        out["ok"] = True
+        _cache_put(FUND_CACHE, ysym, out)
         return out
     except Exception as e:
         log.info(f"{C_WARN} Fundamentals fetch failed for {symbol}: {e}")
@@ -505,28 +540,31 @@ def score_fundamentals(fin: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
     """
     Returns (normalized_score_0_20, breakdown_dict).
     Raw points up to 30, then normalized to 0..20 for blending.
+    - Ignores non-positive PE (no reward for negative PE).
+    - D/E already normalized to ratio in get_fundamentals.
     """
     if not fin or not fin.get("ok"):
         return 0.0, {"ok": False, "reason": fin.get("reason", "no data")}
+
     pts = 0.0
     br: Dict[str, Any] = {"ok": True, "rules": []}
 
-    # Valuation: PE
-    pe_vals = [v for v in [fin.get("trailingPE"), fin.get("forwardPE")] if isinstance(v, (int, float))]
+    # Valuation: PE (use min of trailing/forward; ignore if <= 0)
+    pe_vals = [v for v in [fin.get("trailingPE"), fin.get("forwardPE")] if isinstance(v, (int, float)) and v > 0]
     pe = min(pe_vals) if pe_vals else None
     if pe is not None:
         if pe < 25: pts += 5; br["rules"].append({"factor":"PE","value":pe,"bonus":"+5 (<25)"})
         if pe < 18: pts += 2; br["rules"].append({"factor":"PE","value":pe,"bonus":"+2 (<18)"})
     br["PE_used"] = pe
 
-    # Profitability: ROE
+    # Profitability: ROE (expect 0..1)
     roe = fin.get("returnOnEquity")
     if isinstance(roe, (int, float)):
         if roe > 0.15: pts += 5; br["rules"].append({"factor":"ROE","value":roe,"bonus":"+5 (>15%)"})
         if roe > 0.20: pts += 2; br["rules"].append({"factor":"ROE","value":roe,"bonus":"+2 (>20%)"})
     br["ROE"] = roe
 
-    # Balance sheet: D/E
+    # Balance sheet: D/E (ratio)
     de = fin.get("debtToEquity")
     if isinstance(de, (int, float)):
         if de < 1.0: pts += 5; br["rules"].append({"factor":"D/E","value":de,"bonus":"+5 (<1.0)"})
@@ -548,19 +586,103 @@ def score_fundamentals(fin: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         if gr > 0.05: pts += 5; br["rules"].append({"factor":"Growth","value":gr,"bonus":"+5 (>5%)"})
     br["Growth"] = gr
 
-    # PEG (growth at reasonable price)
+    # PEG
     peg = fin.get("pegRatio")
     if isinstance(peg, (int, float)):
         if peg < 1.5: pts += 5; br["rules"].append({"factor":"PEG","value":peg,"bonus":"+5 (<1.5)"})
         if peg < 1.0: pts += 2; br["rules"].append({"factor":"PEG","value":peg,"bonus":"+2 (<1.0)"})
     br["PEG"] = peg
 
-    # Cap raw at 30; normalize to 0..20 for blending
     raw = min(30.0, max(0.0, pts))
     norm = 20.0 * (raw / 30.0)
     br["raw_points_0_30"] = round(raw, 2)
     br["norm_0_20"] = round(norm, 2)
     return float(round(norm, 2)), br
+
+# -------- Sector / Industry Comparison --------
+def sector_comparison(symbol: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare PE/ROE/D/E vs sector median using a small peer sample."""
+    try:
+        if yf is None or not info or not info.get("ok"):
+            return {"ok": False, "reason": "no fundamentals"}
+
+        sec = info.get("sector") or "Unknown"
+        ind = info.get("industry") or "Unknown"
+        ysym = normalize_symbol_for_india(symbol)
+
+        # small, stable NIFTY peer list
+        nifty_peers = [
+            "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
+            "LT.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS","ITC.NS",
+            "ASIANPAINT.NS","HINDUNILVR.NS","BAJFINANCE.NS","MARUTI.NS","SUNPHARMA.NS"
+        ]
+
+        peers = []
+        for tkr in nifty_peers:
+            if tkr == ysym:  # skip self
+                continue
+            cached = _cache_get(PEER_INFO_CACHE, tkr)
+            if cached is None:
+                try:
+                    i = yf.Ticker(tkr).info or {}
+                    _cache_put(PEER_INFO_CACHE, tkr, i)
+                    cached = i
+                except Exception:
+                    continue
+            if cached.get("sector") == sec:
+                peers.append(cached)
+
+        if not peers:
+            return {"sector": sec, "industry": ind, "ok": False, "reason": "no peers"}
+
+        def sfloat(i, k):
+            v = i.get(k)
+            try:
+                return float(v) if v is not None else math.nan
+            except Exception:
+                return math.nan
+
+        # Collect peer metrics (normalize D/E to ratio)
+        def de_norm(v):
+            if not isinstance(v, (int, float)):
+                return math.nan
+            return v/100.0 if v > 10 else float(v)
+
+        peers_pe  = [sfloat(p, "trailingPE") for p in peers]
+        peers_roe = [sfloat(p, "returnOnEquity") for p in peers]
+        peers_de  = [de_norm(sfloat(p, "debtToEquity")) for p in peers]
+
+        pe_med  = np.nanmedian(peers_pe)  if peers_pe else math.nan
+        roe_med = np.nanmedian(peers_roe) if peers_roe else math.nan
+        de_med  = np.nanmedian(peers_de)  if peers_de else math.nan
+
+        my_pe  = info.get("trailingPE")
+        my_roe = info.get("returnOnEquity")
+        my_de  = info.get("debtToEquity")
+
+        def comp(val, med, mode):
+            if not isinstance(val, (int, float)) or not math.isfinite(val):
+                return "-"
+            if not isinstance(med, (int, float)) or not math.isfinite(med):
+                return "-"
+            if mode == "pe":  return "better" if (val > 0 and val < med) else "worse"
+            if mode == "roe": return "better" if val > med else "worse"
+            if mode == "de":  return "better" if val < med else "worse"
+            return "-"
+
+        return {
+            "ok": True,
+            "sector": sec,
+            "industry": ind,
+            "pe_vs_sector":  comp(my_pe,  pe_med,  "pe"),
+            "roe_vs_sector": comp(my_roe, roe_med, "roe"),
+            "de_vs_sector":  comp(my_de,  de_med,  "de"),
+            "pe_sector_median":  pe_med,
+            "roe_sector_median": roe_med,
+            "de_sector_median":  de_med,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # -------- Scoring & Sizing (technical) --------
 def horizon_params(goal: str) -> dict:
@@ -752,6 +874,8 @@ def make_advice(
     # Fundamentals score (normalized 0..20), blended 20% weight
     fund_info = get_fundamentals(symbol_for_sentiment or "")
     fund_score, fund_break = score_fundamentals(fund_info)
+    # Sector comparison
+    sector_cmp = sector_comparison(symbol_for_sentiment or "", fund_info)
 
     total_score = round(0.8 * tech_score + 0.2 * fund_score, 2)
 
@@ -831,6 +955,8 @@ def make_advice(
         f"Alloc≈₹{max_alloc:.0f}, Risk/Share≈₹{risk_per_share:.2f}"
     )
 
+    trend_strength = float(row.get("TrendStrength", np.nan))
+
     rationale = {
         # keep "score" for UI compatibility + add sub-scores:
         "score": total_score,
@@ -840,6 +966,8 @@ def make_advice(
         "components": breakdown,              # technical components
         "fundamentals": fund_break,           # fundamentals breakdown
         "prob_win_est": round(prob_win, 3),
+        "trend_strength": trend_strength,
+
         "rr_est": round(rr, 2),
         "goal": use_goal,
         "atr": round(atr, 4),
@@ -851,6 +979,7 @@ def make_advice(
         "reasons": reasons,
         "sentiment_factor": breakdown.get("sentiment_factor"),
         "headlines_used": recent_headlines_for(symbol_for_sentiment or "", limit=8),
+        "sector_comparison": sector_cmp,         # new sector vs peers data
     }
 
     return AdviceResponse(
