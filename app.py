@@ -1077,7 +1077,8 @@ def make_advice(
 # ==========================
 @app.api_route("/", methods=["GET", "HEAD"])
 def root_head():
-    return Response(content=_to_jsonable({"ok": True, "version": APP_VERSION}), media_type="application/json")
+    payload = {"ok": True, "version": APP_VERSION}
+    return JSONResponse(content=_to_jsonable(payload))
 
 @app.get("/healthz")
 def healthz():
