@@ -467,48 +467,79 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 # ==========================
-# Market Regime (robust)
+# Market Regime (robust + cached + offline-safe)
 # ==========================
+REGIME_TTL_SEC = 3600  # 1 hour cache
+_REGIME_CACHE = {"ts": 0.0, "payload": None}
+
+def _cache_regime_put(payload: Dict[str, Any]):
+    _REGIME_CACHE["ts"] = time()
+    _REGIME_CACHE["payload"] = payload
+
+def _cache_regime_get() -> Optional[Dict[str, Any]]:
+    if not _REGIME_CACHE["payload"]:
+        return None
+    if time() - _REGIME_CACHE["ts"] > REGIME_TTL_SEC:
+        _REGIME_CACHE["payload"] = None
+        return None
+    return _REGIME_CACHE["payload"]
+
 def get_nifty_regime() -> Dict[str, Any]:
-    """Try ^NSEI → NIFTYBEES.NS → ^BSESN. Flatten columns and use 1-D Series to compare."""
+    """
+    Try ^NSEI → NIFTYBEES.NS → ^BSESN, with a cache.
+    If yfinance is blocked/offline, return a neutral UNKNOWN regime and do NOT keep retrying.
+    """
+    # If cached, use it
+    cached = _cache_regime_get()
+    if cached:
+        return cached
+
     if yf is None:
-        return {"ok": False, "reason": "yfinance missing"}
+        payload = {"ok": False, "regime": "UNKNOWN", "reason": "yfinance missing"}
+        _cache_regime_put(payload)
+        return payload
 
     tried = []
+    # 400d is enough to compute SMA200 without fetching 'max'
     for sym in ["^NSEI", "NIFTYBEES.NS", "^BSESN"]:
-        raw = safe_history(sym, period_first="max")
-        df = normalize_ohlcv_schema(raw)
-        tried.append((sym, len(df)))
-        if len(df) >= 210 and "Close" in df.columns:
-            close = df["Close"]
-            # Ensure 1-D series
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            sma200 = close.rolling(200).mean()
+        try:
+            raw = safe_history(sym, period_first="400d")  # safer than 'max'
+            df = normalize_ohlcv_schema(raw)
+            tried.append((sym, len(df)))
+            if len(df) >= 210 and "Close" in df.columns:
+                close = df["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                sma200 = close.rolling(200).mean()
 
-            # Latest values as scalars
-            try:
                 row_close = float(close.iloc[-1])
                 row_sma200 = float(sma200.iloc[-1])
-            except Exception:
-                continue
 
-            regime_up = row_close > row_sma200
-            ret5d = float((row_close / float(close.iloc[-5])) - 1) if len(close) >= 5 else 0.0
+                regime_up = row_close > row_sma200
+                ret5d = float((row_close / float(close.iloc[-5])) - 1) if len(close) >= 5 else 0.0
 
-            out = {
-                "symbol": sym,
-                "ok": True,
-                "close": round(row_close, 2),
-                "sma200": round(row_sma200, 2),
-                "regime": "UP" if regime_up else "DOWN",
-                "ret_5d": round(ret5d, 4),
-                "proxy": (sym != "^NSEI"),
-            }
-            log.info(f"{C_OK} Regime via {sym}: {out['regime']} | 5d={out['ret_5d']}")
-            return out
+                payload = {
+                    "symbol": sym,
+                    "ok": True,
+                    "close": round(row_close, 2),
+                    "sma200": round(row_sma200, 2),
+                    "regime": "UP" if regime_up else "DOWN",
+                    "ret_5d": round(ret5d, 4),
+                    "proxy": (sym != "^NSEI"),
+                }
+                _cache_regime_put(payload)
+                log.info(f"{C_OK} Regime via {sym}: {payload['regime']} | 5d={payload['ret_5d']}")
+                return payload
+        except Exception as e:
+            # concise, no stack spam
+            log.info(f"{C_WARN} Regime fetch failed for {sym}: {e}")
+            continue
 
-    return {"ok": False, "reason": f"no valid index data {tried}"}
+    # Final offline-safe fallback (don’t penalize advice when we’re blind)
+    payload = {"ok": False, "regime": "UNKNOWN", "reason": f"no valid index data {tried}"}
+    _cache_regime_put(payload)
+    log.info(f"{C_WARN} Regime fallback=UNKNOWN (source offline). Tried={tried}")
+    return payload
 
 # ==========================
 # Sentiment (headlines)
@@ -971,15 +1002,26 @@ def make_advice(
     rr = (tgt1 - close) / (close - stop) if (close - stop) > 0 else 0.0
 
     regime = get_nifty_regime()
-    regime_ok = bool(regime.get("ok") and regime.get("regime") == "UP")
-    if not regime_ok:
+    regime_str = str(regime.get("regime", "UNKNOWN")).upper()
+    regime_ok = (regime.get("ok") is True and regime_str == "UP")
+    regime_unknown = (regime.get("ok") is False or regime_str == "UNKNOWN")
+
+    if regime_ok:
+        pass  # nothing to do
+    elif regime_unknown:
+        # Do NOT penalize when we are offline/unknown
+        log.info(f"{C_WARN} Market regime UNKNOWN — data source offline; not penalizing.")
+    else:
+        # True DOWN regime → tighten slightly
         prob_win = max(0.35, prob_win - 0.03)
         log.info(f"{C_WARN} Market regime DOWN — tightening criteria & sizing")
+
 
     frac1 = risk_fraction(risk_level)
     frac2 = kelly_cap(prob_win, max(1.0, rr))
     base_alloc_frac = max(0.002, min(frac1, frac2 if prob_win > 0.5 else frac1 * 0.7))
-    alloc_frac = base_alloc_frac * (1.0 if regime_ok else 0.8)
+    alloc_frac = base_alloc_frac * (1.0 if (regime_ok or regime_unknown) else 0.8)
+
 
     max_risk_rupees = wallet * max_daily_risk_frac
     risk_per_share_raw = max(close - stop, 0.01)
@@ -997,7 +1039,9 @@ def make_advice(
         "sentiment_ok": breakdown.get("sentiment", 0) > 0,
     }
     green = sum(1 for v in flags.values() if v)
-    min_conf_final = int(min_confluence + (0 if regime_ok else 1))
+    extra_conf = 1 if (not regime_ok and not regime_unknown) else 0
+    min_conf_final = int(min_confluence + extra_conf)
+
 
     reasons: List[str] = []
     if not flags["trend_ok"]:
@@ -1010,7 +1054,9 @@ def make_advice(
         reasons.append("RSI overbought/oversold guard triggered.")
     if breakdown.get("sentiment", 0) <= -5:
         reasons.append("News sentiment adverse.")
-    if not regime_ok:
+    if regime_unknown:
+        reasons.append("Market regime unknown (data source offline); not penalizing.")
+    elif not regime_ok:
         reasons.append("Market regime DOWN (stricter filters & smaller sizing).")
 
     decision = "AVOID"
