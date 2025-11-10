@@ -1,10 +1,9 @@
 services:
   - type: web
     name: stock-advisor-india
-    env: python
+    env: docker
     plan: free
     region: frankfurt
-    pythonVersion: 3.11.9
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
     healthCheckPath: /dashboard
