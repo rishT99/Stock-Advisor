@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+pandas
+numpy
+yfinance
+ta
+feedparser
+colorama
+jinja2
