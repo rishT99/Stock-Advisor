@@ -5,7 +5,7 @@ services:
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     plan: free
-    region: oregon  # or "frankfurt", etc.
+    # region: oregon  # ← remove this line for existing services
     healthCheckPath: /healthz
     envVars:
       - key: PYTHONDONTWRITEBYTECODE
